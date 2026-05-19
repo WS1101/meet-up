@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "619077062615",
+    "project_id": "mobileprogramming-dawhat",
+    "storage_bucket": "mobileprogramming-dawhat.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:619077062615:android:f6105fde5cb775f2ef0592",
+        "android_client_info": {
+          "package_name": "com.seosimlee.dawhat"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAmrIjNjOqRQpfnUiPfzNNlz-KGeRJtwPc"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

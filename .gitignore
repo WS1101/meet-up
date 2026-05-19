@@ -41,3 +41,7 @@ app-example
 # generated native folders
 /ios
 /android
+
+# Google / Firebase Security Settings (★지훈님 프로젝트 보안용 추가)
+google-services.json
+GoogleService-Info.plist
