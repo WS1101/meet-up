@@ -39,6 +39,7 @@ yarn-error.*
 app-example
 
 # generated native folders
+<<<<<<< HEAD
 # /ios
 # /android
 ios/Pods/
@@ -46,3 +47,11 @@ ios/build/
 android/build/
 android/.gradle/
 android/.idea/
+=======
+/ios
+/android
+
+# Google / Firebase Security Settings (★지훈님 프로젝트 보안용 추가)
+google-services.json
+GoogleService-Info.plist
+>>>>>>> origin/SHIM_UI

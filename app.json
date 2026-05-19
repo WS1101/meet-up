@@ -1,16 +1,30 @@
 {
   "expo": {
+<<<<<<< HEAD
     "name": "meetup-app",
     "slug": "meetup-app",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "meetupapp",
+=======
+    "name": "MyLocationApp",
+    "slug": "MyLocationApp",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/icon.png",
+    "scheme": "mylocationapp",
+>>>>>>> origin/SHIM_UI
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
       "supportsTablet": true,
+<<<<<<< HEAD
       "bundleIdentifier": "com.anonymous.meetup-app"
+=======
+      "bundleIdentifier": "com.anyway.dawhat",
+      "googleServicesFile": "./GoogleService-Info.plist"
+>>>>>>> origin/SHIM_UI
     },
     "android": {
       "adaptiveIcon": {
@@ -20,7 +34,13 @@
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
       "edgeToEdgeEnabled": true,
+<<<<<<< HEAD
       "predictiveBackGestureEnabled": false
+=======
+      "predictiveBackGestureEnabled": false,
+      "package": "com.anyway.dawhat",
+      "googleServicesFile": "./google-services.json"
+>>>>>>> origin/SHIM_UI
     },
     "web": {
       "output": "static",
@@ -46,4 +66,8 @@
       "reactCompiler": true
     }
   }
+<<<<<<< HEAD
 }
+=======
+}
+>>>>>>> origin/SHIM_UI
