@@ -11,6 +11,8 @@
 		3E461D99554A48A4959DE609 /* SplashScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = AA286B85B6C04FC6940260E9 /* SplashScreen.storyboard */; };
 		54C40172DE1D7B27CA5C41D7 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = F03CE2767216294EDF4B8F92 /* PrivacyInfo.xcprivacy */; };
 		7A10716AD9185997F633D08A /* libPods-meetupapp.a in Frameworks */ = {isa = PBXBuildFile; fileRef = DFEE3ED35ED0C93B30731EA7 /* libPods-meetupapp.a */; };
+		AAD016802FBC6FCF008BF1B7 /* BLEPeripheralModule.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD0167F2FBC6FCF008BF1B7 /* BLEPeripheralModule.swift */; };
+		AAD016812FBC6FCF008BF1B7 /* BLEPeripheralModule.m in Sources */ = {isa = PBXBuildFile; fileRef = AAD0167E2FBC6FCF008BF1B7 /* BLEPeripheralModule.m */; };
 		AAD7F9162FB71DDD00250E87 /* UWBModule.m in Sources */ = {isa = PBXBuildFile; fileRef = AAD7F9142FB71DDD00250E87 /* UWBModule.m */; };
 		AAD7F9172FB71DDD00250E87 /* UWBModule.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD7F9152FB71DDD00250E87 /* UWBModule.swift */; };
 		BB2F792D24A3F905000567C9 /* Expo.plist in Resources */ = {isa = PBXBuildFile; fileRef = BB2F792C24A3F905000567C9 /* Expo.plist */; };
@@ -25,6 +27,8 @@
 		13B07FB61A68108700A75B9A /* Info.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; name = Info.plist; path = meetupapp/Info.plist; sourceTree = "<group>"; };
 		2DF629EF748A86E46C4A1912 /* ExpoModulesProvider.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ExpoModulesProvider.swift; path = "Pods/Target Support Files/Pods-meetupapp/ExpoModulesProvider.swift"; sourceTree = "<group>"; };
 		AA286B85B6C04FC6940260E9 /* SplashScreen.storyboard */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = file.storyboard; name = SplashScreen.storyboard; path = meetupapp/SplashScreen.storyboard; sourceTree = "<group>"; };
+		AAD0167E2FBC6FCF008BF1B7 /* BLEPeripheralModule.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = BLEPeripheralModule.m; sourceTree = "<group>"; };
+		AAD0167F2FBC6FCF008BF1B7 /* BLEPeripheralModule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BLEPeripheralModule.swift; sourceTree = "<group>"; };
 		AAD7F9142FB71DDD00250E87 /* UWBModule.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = UWBModule.m; sourceTree = "<group>"; };
 		AAD7F9152FB71DDD00250E87 /* UWBModule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UWBModule.swift; sourceTree = "<group>"; };
 		BB2F792C24A3F905000567C9 /* Expo.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; path = Expo.plist; sourceTree = "<group>"; };
@@ -51,6 +55,8 @@
 		13B07FAE1A68108700A75B9A /* meetupapp */ = {
 			isa = PBXGroup;
 			children = (
+				AAD0167E2FBC6FCF008BF1B7 /* BLEPeripheralModule.m */,
+				AAD0167F2FBC6FCF008BF1B7 /* BLEPeripheralModule.swift */,
 				AAD7F9142FB71DDD00250E87 /* UWBModule.m */,
 				AAD7F9152FB71DDD00250E87 /* UWBModule.swift */,
 				F11748412D0307B40044C1D9 /* AppDelegate.swift */,
@@ -334,6 +340,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AAD016802FBC6FCF008BF1B7 /* BLEPeripheralModule.swift in Sources */,
+				AAD016812FBC6FCF008BF1B7 /* BLEPeripheralModule.m in Sources */,
 				AAD7F9162FB71DDD00250E87 /* UWBModule.m in Sources */,
 				AAD7F9172FB71DDD00250E87 /* UWBModule.swift in Sources */,
 				F11748422D0307B40044C1D9 /* AppDelegate.swift in Sources */,
