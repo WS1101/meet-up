@@ -50,18 +50,16 @@ export default function Index() {
   // 대화 및 리퀴드 글래스 관련 상태
   const [isChatOpen, setIsChatOpen] = useState(false);
   const [chatInput, setChatInput] = useState<string>('');
-
-  // ★ 핵심 뼈대 변경: 서버에서 오는 한 줄을 받아서 앱 내부(UI)에 누적할 히스토리 배열 상태 ★
   const [chatHistory, setChatHistory] = useState<any[]>([]);
   const flatListRef = useRef<FlatList>(null);
 
-  // 이전 수신 메시지의 타임스탬프를 기억해서 중복 누적을 방지하는 Ref
-  const lastMsgTimestamp = useRef<number>(0);
+  // ★ 신규 상태: 내 닉네임 및 실제 매칭된 친구 기록 배열 (초기값 빈 배열) ★
+  const [myNameInput, setMyNameInput] = useState<string>('');
+  const [recentFriends, setRecentFriends] = useState<any[]>([]);
 
-  const [recentFriends] = useState([
-    { id: 1, name: '김철수', date: '방금 전' },
-    { id: 2, name: '이영희', date: '2일 전' },
-  ]);
+  const lastMsgTimestamp = useRef<number>(0);
+  const locationSubscription = useRef<any>(null);
+  const headingSubscription = useRef<any>(null);
 
   const KOREA_CENTER = { latitude: 37.5564, longitude: 126.9723 };
 
@@ -78,70 +76,91 @@ export default function Index() {
 
   // 2. 위치 실시간 감시 및 Firebase 전송
   useEffect(() => {
-    let locSub: any;
-    let headSub: any;
+    let active = true;
 
     (async () => {
       let { status } = await Location.requestForegroundPermissionsAsync();
       if (status !== 'granted') return;
 
-      let initialLoc = await Location.getCurrentPositionAsync({});
-      setMyLocation({ latitude: initialLoc.coords.latitude, longitude: initialLoc.coords.longitude });
+      let initialLoc = await Location.getCurrentPositionAsync({ timeout: 5000 }).catch(() => null);
+      if (initialLoc && active) {
+        setMyLocation({ latitude: initialLoc.coords.latitude, longitude: initialLoc.coords.longitude });
+      }
 
-      locSub = await Location.watchPositionAsync(
-        { accuracy: Location.Accuracy.High, distanceInterval: 1 },
-        (loc) => {
-          const currentPos: any = {
-            lat: loc.coords.latitude,
-            lon: loc.coords.longitude,
-            timestamp: Date.now()
-          };
-          setMyLocation({ latitude: currentPos.lat, longitude: currentPos.lon });
+      if (appState === 'MAIN') {
+        if (locationSubscription.current) locationSubscription.current.remove();
+        if (headingSubscription.current) headingSubscription.current.remove();
 
-          const roomID = userRole === 'userA' ? myInviteCode : inputCode;
-          if (appState === 'MAIN' && roomID && userRole) {
-            update(ref(db, `sessions/${roomID}/${userRole}`), currentPos);
+        locationSubscription.current = await Location.watchPositionAsync(
+          { accuracy: Location.Accuracy.High, distanceInterval: 1 },
+          (loc) => {
+            const currentPos: any = {
+              lat: loc.coords.latitude,
+              lon: loc.coords.longitude,
+              timestamp: Date.now()
+            };
+            setMyLocation({ latitude: currentPos.lat, longitude: currentPos.lon });
+
+            const roomID = userRole === 'userA' ? myInviteCode : inputCode;
+            if (roomID && userRole) {
+              update(ref(db, `sessions/${roomID}/${userRole}`), currentPos).catch(e => console.log(e.message));
+            }
           }
-        }
-      );
+        );
 
-      headSub = await Location.watchHeadingAsync((data) => {
-        setHeading(data.magHeading);
-      });
+        headingSubscription.current = await Location.watchHeadingAsync((data) => {
+          setHeading(data.magHeading);
+        });
+      }
     })();
 
     return () => {
-      if (locSub) locSub.remove();
-      if (headSub) headSub.remove();
+      active = false;
+      if (locationSubscription.current) {
+        locationSubscription.current.remove();
+        locationSubscription.current = null;
+      }
+      if (headingSubscription.current) {
+        headingSubscription.current.remove();
+        headingSubscription.current = null;
+      }
     };
   }, [appState, userRole, myInviteCode, inputCode]);
 
-  // 3. 상대방 위치 실시간 수신 및 ★UI 단독 누적 리스너★
+  // 3. 상대방 위치 실시간 수신 및 ★진짜 이름 감지 후 최근 기록 누적★
   useEffect(() => {
     const roomID = userRole === 'userA' ? myInviteCode : inputCode;
     if (!roomID || appState !== 'MAIN') return;
 
     const otherUser = userRole === 'userA' ? 'userB' : 'userA';
 
-    // 상대방 위치 감시
     const otherRef = ref(db, `sessions/${roomID}/${otherUser}`);
     const unsubLocation = onValue(otherRef, (snapshot) => {
       const data = snapshot.val();
-      if (data && data.lat && data.lon) {
-        setTargetLoc({ latitude: data.lat, longitude: data.lon });
+      if (data) {
+        if (data.lat && data.lon) {
+          setTargetLoc({ latitude: data.lat, longitude: data.lon });
+        }
+
+        // ★ 상대방이 입장해서 이름을 공유했다면 내 로컬 화면 기록(recentFriends)에 실시간 자동 누적 ★
+        if (data.name) {
+          setRecentFriends((prev) => {
+            // 이미 목록에 존재하는 이름이면 중복 추가 방지
+            if (prev.some(f => f.name === data.name)) return prev;
+            // 새 친구 목록에 맨 위로 쌓기
+            return [{ id: String(Date.now()), name: data.name, date: '방금 전' }, ...prev];
+          });
+        }
       } else {
         setTargetLoc(null);
       }
     });
 
-    // ★ 단일 chat 노드를 보되, 새로운 타임스탬프가 감지되면 UI 배열에 push로 쌓아버림 ★
     const chatRef = ref(db, `sessions/${roomID}/chat`);
     const unsubChat = onValue(chatRef, (snapshot) => {
       const data = snapshot.val();
       if (data && data.text && data.timestamp !== lastMsgTimestamp.current) {
-        lastMsgTimestamp.current = data.timestamp; // 최근 찍힌 시간 낙인
-
-        // 내 폰 화면 상태(History)에만 대화 추가 (서버에는 안 쌓임!)
+        lastMsgTimestamp.current = data.timestamp;
         setChatHistory((prev) => [
           ...prev,
           { id: String(data.timestamp), sender: data.sender, text: data.text }
@@ -155,7 +174,6 @@ export default function Index() {
     };
   }, [appState, userRole, myInviteCode, inputCode]);
 
-  // ★ 서버엔 기존 방식대로 set()으로 덮어쓰기 날리기 ★
   const sendChatMessage = () => {
     if (!chatInput.trim()) return;
     const roomID = userRole === 'userA' ? myInviteCode : inputCode;
@@ -165,7 +183,7 @@ export default function Index() {
         sender: userRole,
         text: chatInput.trim(),
         timestamp: Date.now()
-      });
+      }).catch(e => console.log(e.message));
       setChatInput('');
     }
   };
@@ -190,45 +208,70 @@ export default function Index() {
     Alert.alert("복사 완료", "초대 코드가 클립보드에 복사되었습니다.");
   };
 
-  const createRoom = () => {
-    if (!myLocation) return Alert.alert("위치 정보를 가져오는 중입니다.");
+  // 방 생성 (내 이름 탑재)
+  const createRoom = async () => {
+    if (!myNameInput.trim()) return Alert.alert("확인", "사용하실 닉네임을 먼저 입력해주세요.");
+    if (!myLocation) return Alert.alert("알림", "위치 정보를 수신하는 중입니다. 잠시 후 다시 누르세요.");
     setUserRole('userA');
-    const userRef = ref(db, `sessions/${myInviteCode}/userA`);
-    set(userRef, {
-      lat: myLocation.latitude,
-      lon: myLocation.longitude,
-      timestamp: Date.now(),
-      serverCreatedAt: serverTimestamp()
-    });
-    onDisconnect(userRef).remove();
-    setAppState('MAIN');
+
+    try {
+      const userRef = ref(db, `sessions/${myInviteCode}/userA`);
+      await set(userRef, {
+        lat: myLocation.latitude,
+        lon: myLocation.longitude,
+        name: myNameInput.trim(), // 내 이름 업로드!
+        timestamp: Date.now(),
+        serverCreatedAt: serverTimestamp()
+      });
+      onDisconnect(userRef).remove();
+      setAppState('MAIN');
+    } catch (e) {
+      Alert.alert("에러", "Firebase Database 권한을 확인하세요.");
+    }
   };
 
-  const joinRoom = (code?: string) => {
-    const finalCode = code || inputCode;
-    if (finalCode.length < 6) return Alert.alert("올바른 코드를 입력해주세요.");
+  // 입장하기 (내 이름 탑재)
+  const joinRoom = async () => {
+    if (!myNameInput.trim()) return Alert.alert("확인", "사용하실 닉네임을 먼저 입력해주세요.");
+    if (inputCode.length < 6) return Alert.alert("오류", "올바른 6자리 코드를 입력해주세요.");
     setUserRole('userB');
-    const userRef = ref(db, `sessions/${finalCode}/userB`);
-    set(userRef, {
-      lat: myLocation ? myLocation.latitude : 0,
-      lon: myLocation ? myLocation.longitude : 0,
-      timestamp: Date.now()
-    });
-    onDisconnect(userRef).remove();
-    if (code) setInputCode(code);
-    setAppState('MAIN');
+
+    try {
+      const userRef = ref(db, `sessions/${inputCode}/userB`);
+      await set(userRef, {
+        lat: myLocation ? myLocation.latitude : KOREA_CENTER.latitude,
+        lon: myLocation ? myLocation.longitude : KOREA_CENTER.longitude,
+        name: myNameInput.trim(), // 내 이름 업로드!
+        timestamp: Date.now()
+      });
+      onDisconnect(userRef).remove();
+      setAppState('MAIN');
+    } catch (e) {
+      Alert.alert("오류", "방 입장에 실패했습니다.");
+    }
   };
 
+  // 종료 (최근 친구 목록은 파괴하지 않고 유지)
   const exitSession = async () => {
+    if (locationSubscription.current) {
+      locationSubscription.current.remove();
+      locationSubscription.current = null;
+    }
+    if (headingSubscription.current) {
+      headingSubscription.current.remove();
+      headingSubscription.current = null;
+    }
+
     const roomID = userRole === 'userA' ? myInviteCode : inputCode;
     if (roomID && userRole) {
-      await remove(ref(db, `sessions/${roomID}`));
+      await remove(ref(db, `sessions/${roomID}`)).catch(e => console.log(e.message));
     }
+
     setAppState('TOKEN');
     setUserRole(null);
     setTargetLoc(null);
     setDistance(0);
-    setChatHistory([]); // 퇴근 시 로컬 UI 대화방도 초기화
+    setChatHistory([]);
     lastMsgTimestamp.current = 0;
     setIsChatOpen(false);
     generateInviteCode();
@@ -251,6 +294,20 @@ export default function Index() {
       <SafeAreaView style={styles.safeArea}>
         <ScrollView contentContainerStyle={styles.tokenContainer}>
           <Text style={styles.mainTitle}>위치 공유 시작</Text>
+
+          {/* ★ 심플 UI 디자인: 맨 상단에 배치된 내 닉네임 설정 칸 ★ */}
+          <View style={styles.nameSetupCard}>
+            <Text style={styles.nameSetupLabel}>나의 닉네임 설정</Text>
+            <TextInput
+              style={styles.nameSetupInput}
+              placeholder="상대방에게 보여질 이름 입력"
+              placeholderTextColor="#9CA3AF"
+              value={myNameInput}
+              onChangeText={setMyNameInput}
+              maxLength={10}
+            />
+          </View>
+
           <View style={styles.codeSection}>
             <Text style={styles.sectionLabel}>나의 공유 코드 (방장)</Text>
             <TouchableOpacity style={styles.codeCard} onPress={copyToClipboard}>
@@ -261,6 +318,7 @@ export default function Index() {
               <Text style={styles.mainStartBtnText}>방 생성하고 공유 시작</Text>
             </TouchableOpacity>
           </View>
+
           <View style={styles.shareOptions}>
             <TouchableOpacity style={[styles.shareBtn, { backgroundColor: '#FEE500' }]} onPress={() => Alert.alert("공유", "카카오톡 전송")}>
               <Text style={styles.shareBtnText}>카카오톡</Text>
@@ -272,25 +330,34 @@ export default function Index() {
               <Text style={[styles.shareBtnText, { color: '#fff' }]}>링크 복사</Text>
             </TouchableOpacity>
           </View>
+
           <View style={styles.joinSection}>
             <Text style={styles.sectionLabel}>초대 코드로 입장 (게스트)</Text>
             <View style={styles.joinInputRow}>
               <TextInput style={styles.joinInput} placeholder="6자리 코드 입력" value={inputCode} onChangeText={setInputCode} maxLength={6} autoCapitalize="characters" />
-              <TouchableOpacity style={styles.joinBtn} onPress={() => joinRoom()}><Text style={{color: '#fff', fontWeight: 'bold'}}>입장</Text></TouchableOpacity>
+              <TouchableOpacity style={styles.joinBtn} onPress={joinRoom}><Text style={{color: '#fff', fontWeight: 'bold'}}>입장</Text></TouchableOpacity>
             </View>
           </View>
+
+          {/* ★ 최근 함께한 친구 섹션: 처음엔 비어있다가 연동 시 동적 렌더링 ★ */}
           <View style={styles.recentSection}>
             <Text style={styles.sectionLabel}>최근 함께한 친구</Text>
-            {recentFriends.map(friend => (
-              <TouchableOpacity key={friend.id} style={styles.friendItem} onPress={() => joinRoom('TEST01')}>
-                <View style={friend.friendProfile}><Text style={styles.friendInitial}>{friend.name[0]}</Text></View>
-                <View style={styles.friendInfo}>
-                  <Text style={styles.friendName}>{friend.name}</Text>
-                  <Text style={styles.friendDate}>{friend.date}</Text>
+            {recentFriends.length > 0 ? (
+              recentFriends.map(friend => (
+                <View key={friend.id} style={styles.friendItem}>
+                  <View style={styles.friendProfile}><Text style={styles.friendInitial}>{friend.name[0]}</Text></View>
+                  <View style={styles.friendInfo}>
+                    <Text style={styles.friendName}>{friend.name}</Text>
+                    <Text style={styles.friendDate}>{friend.date}</Text>
+                  </View>
+                  <View style={styles.statusBadge}><Text style={styles.statusBadgeText}>기록됨 ✓</Text></View>
                 </View>
-                <Text style={styles.startText}>시작 ›</Text>
-              </TouchableOpacity>
-            ))}
+              ))
+            ) : (
+              <View style={styles.emptyRecentBox}>
+                <Text style={styles.emptyRecentText}>아직 함께 공유한 친구 기록이 없습니다.</Text>
+              </View>
+            )}
           </View>
         </ScrollView>
       </SafeAreaView>
@@ -301,7 +368,6 @@ export default function Index() {
     <SafeAreaView style={styles.safeArea}>
       <StatusBar barStyle="dark-content" />
 
-      {/* 지도 뷰 레이어 */}
       <View style={styles.fullMapContainer}>
         {activeTab === 'MAP' ? (
           <MapView
@@ -337,7 +403,6 @@ export default function Index() {
         )}
       </View>
 
-      {/* 상단 탭 */}
       <View style={styles.glassTabContainer}>
         <TouchableOpacity style={[styles.glassTabBtn, activeTab === 'MAP' && styles.activeGlassTab]} onPress={() => setActiveTab('MAP')}>
           <Text style={[styles.glassTabText, activeTab === 'MAP' && styles.activeGlassTabText]}>지도</Text>
@@ -347,14 +412,12 @@ export default function Index() {
         </TouchableOpacity>
       </View>
 
-      {/* 우측 하단 플로팅 버튼 */}
       {!isChatOpen && (
         <TouchableOpacity style={styles.floatingChatBtn} onPress={() => setIsChatOpen(true)}>
           <Text style={styles.floatingChatBtnText}>💬 대화하기</Text>
         </TouchableOpacity>
       )}
 
-      {/* ★ 리퀴드 글래스 역사 복구 패널 (FlatList 부활) ★ */}
       {isChatOpen && (
         <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.glassChatOverlay}>
           <View style={styles.liquidGlassPanel}>
@@ -365,7 +428,6 @@ export default function Index() {
               </TouchableOpacity>
             </View>
 
-            {/* 서버엔 한 줄만 있지만 UI 상에는 누적되어 가독성 확보 */}
             <FlatList
               ref={flatListRef}
               data={chatHistory}
@@ -403,7 +465,6 @@ export default function Index() {
         </KeyboardAvoidingView>
       )}
 
-      {/* 하단 미니 바 */}
       {!isChatOpen && (
         <View style={styles.minimalBottomBar}>
           <View style={styles.miniInfo}>
@@ -424,7 +485,13 @@ const styles = StyleSheet.create({
   full: { flex: 1 },
   fullMapContainer: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
   tokenContainer: { padding: 24 },
-  mainTitle: { fontSize: 24, fontWeight: 'bold', marginBottom: 32, marginTop: 20 },
+  mainTitle: { fontSize: 24, fontWeight: 'bold', marginBottom: 20, marginTop: 20 },
+
+  // 닉네임 입력 컴포넌트 카드 디자인
+  nameSetupCard: { backgroundColor: '#F3F4F6', padding: 16, borderRadius: 16, borderHorizontal: 1, borderColor: '#E5E7EB', marginBottom: 24 },
+  nameSetupLabel: { fontSize: 13, fontWeight: '700', color: '#4B5563', marginBottom: 6 },
+  nameSetupInput: { backgroundColor: '#FFFFFF', borderWidth: 1, borderColor: '#D1D5DB', borderRadius: 10, paddingHorizontal: 14, height: 44, fontSize: 14, color: '#111827' },
+
   codeSection: { alignItems: 'center', marginBottom: 24 },
   sectionLabel: { fontSize: 15, fontWeight: '700', color: '#111827', marginBottom: 10, alignSelf: 'flex-start' },
   codeCard: { backgroundColor: '#F9FAFB', width: '100%', padding: 24, borderRadius: 20, borderWidth: 1, borderColor: '#E5E7EB', alignItems: 'center' },
@@ -439,31 +506,33 @@ const styles = StyleSheet.create({
   joinInputRow: { flexDirection: 'row', gap: 10 },
   joinInput: { flex: 1, backgroundColor: '#F9FAFB', borderWidth: 1, borderColor: '#E5E7EB', borderRadius: 12, paddingHorizontal: 16, fontSize: 16 },
   joinBtn: { backgroundColor: '#111827', paddingHorizontal: 24, justifyContent: 'center', alignItems: 'center', borderRadius: 12 },
-  recentSection: { flex: 1, marginTop: 10 },
-  friendItem: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#FFF', padding: 16, borderRadius: 16, marginBottom: 12, borderWidth: 1, borderColor: '#E5E7EB' },
-  friendProfile: { width: 44, height: 44, borderRadius: 22, backgroundColor: '#EFF6FF', justifyContent: 'center', alignItems: 'center', marginRight: 14 },
-  friendInitial: { color: '#2563EB', fontWeight: 'bold', fontSize: 16 },
+
+  // 친구 목록 UI 구조화
+  recentSection: { flex: 1, marginTop: 10, paddingBottom: 40 },
+  friendItem: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#FFF', padding: 14, borderRadius: 16, marginBottom: 12, borderWidth: 1, borderColor: '#E5E7EB' },
+  friendProfile: { width: 40, height: 40, borderRadius: 20, backgroundColor: '#EFF6FF', justifyContent: 'center', alignItems: 'center', marginRight: 12 },
+  friendInitial: { color: '#2563EB', fontWeight: 'bold', fontSize: 15 },
   friendInfo: { flex: 1 },
-  friendName: { fontSize: 16, fontWeight: 'bold' },
-  friendDate: { fontSize: 12, color: '#6B7280' },
-  startText: { color: '#2563EB', fontWeight: '600' },
+  friendName: { fontSize: 15, fontWeight: 'bold', color: '#111827' },
+  friendDate: { fontSize: 11, color: '#6B7280', marginTop: 2 },
+  statusBadge: { backgroundColor: '#F3F4F6', paddingHorizontal: 10, paddingVertical: 4, borderRadius: 12 },
+  statusBadgeText: { color: '#10B981', fontWeight: '700', fontSize: 11 },
+  emptyRecentBox: { backgroundColor: '#F9FAFB', borderStyle: 'dashed', borderWidth: 1, borderColor: '#D1D5DB', borderRadius: 16, paddingVertical: 30, alignItems: 'center', justifyContent: 'center' },
+  emptyRecentText: { color: '#9CA3AF', fontSize: 13, fontWeight: '500' },
 
   glassTabContainer: { flexDirection: 'row', position: 'absolute', top: 60, alignSelf: 'center', backgroundColor: 'rgba(255, 255, 255, 0.6)', borderRadius: 25, padding: 5, borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.4)', zIndex: 10 },
   glassTabBtn: { paddingHorizontal: 25, paddingVertical: 10, borderRadius: 20 },
   activeGlassTab: { backgroundColor: '#fff' },
   glassTabText: { fontSize: 14, color: '#666', fontWeight: '600' },
   activeGlassTabText: { color: '#2563EB' },
-
-  floatingChatBtn: { position: 'absolute', bottom: 110, right: 20, backgroundColor: '#111827', paddingHorizontal: 20, paddingVertical: 12, borderRadius: 25, elevation: 10, shadowColor: '#000', shadowOpacity: 0.2, shadowRadius: 10 },
+  floatingChatBtn: { position: 'absolute', bottom: 110, right: 20, backgroundColor: '#111827', paddingHorizontal: 20, paddingVertical: 12, borderRadius: 25, zIndex: 10 },
   floatingChatBtnText: { color: '#fff', fontWeight: 'bold' },
-
-  glassChatOverlay: { position: 'absolute', bottom: 0, left: 0, right: 0, height: height * 0.45, zIndex: 999 }, // 높이 밸런스 재조정
-  liquidGlassPanel: { flex: 1, backgroundColor: 'rgba(255, 255, 255, 0.85)', borderTopLeftRadius: 35, borderTopRightRadius: 35, borderWidth: 1.5, borderColor: 'rgba(255, 255, 255, 0.5)', shadowColor: '#000', shadowOpacity: 0.1, shadowRadius: 20 },
+  glassChatOverlay: { position: 'absolute', bottom: 0, left: 0, right: 0, height: height * 0.45, zIndex: 999 },
+  liquidGlassPanel: { flex: 1, backgroundColor: 'rgba(255, 255, 255, 0.85)', borderTopLeftRadius: 35, borderTopRightRadius: 35, borderWidth: 1.5, borderColor: 'rgba(255, 255, 255, 0.5)' },
   glassHeader: { padding: 15, alignItems: 'center', marginBottom: 5 },
   glassHandle: { width: 40, height: 5, backgroundColor: 'rgba(0,0,0,0.1)', borderRadius: 10, marginBottom: 10 },
   glassCloseBtn: { position: 'absolute', right: 20, top: 15 },
   glassCloseBtnText: { color: '#666', fontWeight: '600' },
-
   chatBubbleWrapper: { flexDirection: 'row', marginVertical: 4, width: '100%' },
   chatMeWrapper: { justifyContent: 'flex-end' },
   chatOtherWrapper: { justifyContent: 'flex-start' },
@@ -474,25 +543,22 @@ const styles = StyleSheet.create({
   chatTextMe: { color: '#fff' },
   chatTextOther: { color: '#333' },
   emptyGlassText: { color: '#999', textAlign: 'center', fontStyle: 'italic', fontSize: 13, marginTop: 50 },
-
   glassInputArea: { flexDirection: 'row', padding: 20, paddingBottom: Platform.OS === 'ios' ? 40 : 20, borderTopWidth: 1, borderTopColor: 'rgba(0,0,0,0.05)' },
   glassTextInput: { flex: 1, backgroundColor: 'rgba(255, 255, 255, 0.8)', height: 48, borderRadius: 24, paddingHorizontal: 20, borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.5)' },
   glassSendBtn: { marginLeft: 10, backgroundColor: '#111827', paddingHorizontal: 20, borderRadius: 24, justifyContent: 'center' },
   glassSendBtnText: { color: '#fff', fontWeight: 'bold' },
-
-  minimalBottomBar: { position: 'absolute', bottom: 30, left: 20, right: 20, height: 70, backgroundColor: 'rgba(255, 255, 255, 0.9)', borderRadius: 20, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 20, borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.5)', shadowColor: '#000', shadowOpacity: 0.05, shadowRadius: 10 },
+  minimalBottomBar: { position: 'absolute', bottom: 30, left: 20, right: 20, height: 70, backgroundColor: 'rgba(255, 255, 255, 0.9)', borderRadius: 20, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 20, borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.5)' },
   miniInfo: { flex: 1 },
   miniLabel: { fontSize: 10, color: '#999', fontWeight: 'bold' },
   miniValue: { fontSize: 20, fontWeight: 'bold', color: '#2563EB' },
   miniExitBtn: { backgroundColor: '#FF4444', paddingHorizontal: 15, paddingVertical: 8, borderRadius: 12 },
   miniExitText: { color: '#fff', fontWeight: 'bold', fontSize: 12 },
-
   mainView: { flex: 1 },
   arrowCenter: { flex: 1, justifyContent: 'center', alignItems: 'center' },
   outerCircle: { width: 220, height: 220, borderRadius: 110, backgroundColor: 'rgba(255, 255, 255, 0.8)', justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.4)' },
   arrowWrapper: { alignItems: 'center', justifyContent: 'center' },
   arrowHead: { width: 0, height: 0, borderLeftWidth: 30, borderLeftColor: 'transparent', borderRightWidth: 30, borderRightColor: 'transparent', borderBottomWidth: 45, borderBottomColor: '#2563EB' },
   arrowStem: { width: 22, height: 45, backgroundColor: '#2563EB', marginTop: -5 },
-  simpleMarker: { width: 60, height: 60, alignItems: 'center', justifyContent: 'center' },
+  simpleMarker: { width: 60, height: 60, alignItems: 'center', justifyContent: 'center', backgroundColor: 'transparent' },
   dotCore: { width: 18, height: 18, borderRadius: 9, borderWidth: 3, borderColor: '#FFFFFF', elevation: 6 }
 });
