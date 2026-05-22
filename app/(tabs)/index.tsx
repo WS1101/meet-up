@@ -1,36 +1,27 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { StyleSheet, Text, View, TouchableOpacity, Dimensions, StatusBar, SafeAreaView, ScrollView, Alert, TextInput, KeyboardAvoidingView, Platform, FlatList } from 'react-native';
 import MapView, { Marker, Polyline, PROVIDER_GOOGLE } from 'react-native-maps';
-import * as Location from 'expo-location';
 import * as Clipboard from 'expo-clipboard';
+import { ref, set, onValue } from 'firebase/database';
 
-// Firebase 관련 임포트
-import { initializeApp } from 'firebase/app';
-import { getDatabase, ref, set, onValue, update, onDisconnect, remove, serverTimestamp } from 'firebase/database';
-
-// ★ 본인의 Firebase 프로젝트 설정값으로 교체하세요 ★
-const firebaseConfig = {
-  apiKey: "YOUR_API_KEY",
-  authDomain: "YOUR_PROJECT.firebaseapp.com",
-  databaseURL: "https://mobileprogramming-dawhat-default-rtdb.asia-southeast1.firebasedatabase.app/",
-  projectId: "YOUR_PROJECT_ID",
-  storageBucket: "YOUR_PROJECT.appspot.com",
-  messagingSenderId: "YOUR_SENDER_ID",
-  appId: "YOUR_APP_ID"
-};
-
-const app = initializeApp(firebaseConfig);
-const db = getDatabase(app);
+// ★ 경로 수정: 한 단계 더 올라가서 루트의 firebase와 services를 바라보도록 복구 ★
+import { db } from '../../firebase/config';
+import { requestPermission, watchLocation } from '../../services/location';
+import * as Session from '../../services/session';
+import { calculatePosition } from '../../services/positioning';
+import { startUWB, stopUWB, UWB_ENTER_THRESHOLD, UWB_EXIT_THRESHOLD } from '../../services/uwb';
+import {
+  requestBLEPermissions, startAdvertising, stopAdvertising,
+  startScanning, stopScanning, rssiToDistance,
+} from '../../services/ble';
 
 const { width, height } = Dimensions.get('window');
+const UWB_TIMEOUT_MS = 3000;
+
 const COLORS = {
-  bg: '#FFFFFF',
-  surface: '#F9FAFB',
-  border: '#E5E7EB',
-  text: '#111827',
-  textSecondary: '#6B7280',
-  primary: '#2563EB',
-  accent: '#F97316',
+  bg: '#FFFFFF', surface: '#F9FAFB', border: '#E5E7EB',
+  text: '#111827', textSecondary: '#6B7280',
+  primary: '#2563EB', accent: '#F97316',
 };
 
 const refinedMapStyle = [{ "elementType": "geometry", "stylers": [{ "color": "#f5f5f5" }] }, { "featureType": "road", "elementType": "geometry", "stylers": [{ "color": "#ffffff" }] }, { "featureType": "water", "elementType": "geometry", "stylers": [{ "color": "#d2e5f9" }] }, { "featureType": "poi", "stylers": [{ "visibility": "off" }] }];
@@ -46,227 +37,239 @@ export default function Index() {
   const [inputCode, setInputCode] = useState<string>('');
   const [userRole, setUserRole] = useState<'userA' | 'userB' | null>(null);
   const [trackChanges, setTrackChanges] = useState(true);
-
-  // 대화 및 리퀴드 글래스 관련 상태
   const [isChatOpen, setIsChatOpen] = useState(false);
   const [chatInput, setChatInput] = useState<string>('');
   const [chatHistory, setChatHistory] = useState<any[]>([]);
   const flatListRef = useRef<FlatList>(null);
+  const lastMsgTimestamp = useRef<number>(0);
 
-  // ★ 신규 상태: 내 닉네임 및 실제 매칭된 친구 기록 배열 (초기값 빈 배열) ★
+  // 실시간 매칭 친구 기록 배열
   const [myNameInput, setMyNameInput] = useState<string>('');
   const [recentFriends, setRecentFriends] = useState<any[]>([]);
 
-  const lastMsgTimestamp = useRef<number>(0);
-  const locationSubscription = useRef<any>(null);
-  const headingSubscription = useRef<any>(null);
+  // 백엔드 refs
+  const partnerLocRef = useRef<any>(null);
+  const uwbActiveRef = useRef(false);
+  const lastUwbTimeRef = useRef<number>(0);
+  const uwbDistanceRef = useRef<number | null>(null);
+  const uwbAzimuthRef = useRef<number | null>(null);
+  const routerDataRef = useRef<any[]>([]);
 
   const KOREA_CENTER = { latitude: 37.5564, longitude: 126.9723 };
 
   const generateInviteCode = () => {
-    const charSet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-    let code = '';
-    for (let i = 0; i < 6; i++) code += charSet[Math.floor(Math.random() * charSet.length)];
-    setMyInviteCode(code);
+    const token = Session.createToken();
+    setMyInviteCode(token);
   };
 
+  useEffect(() => { generateInviteCode(); }, []);
+
+  // 나침반
   useEffect(() => {
-    generateInviteCode();
+    let headSub: any;
+    (async () => {
+      const Location = require('expo-location');
+      headSub = await Location.watchHeadingAsync((data: any) => {
+        setHeading(data.magHeading);
+      });
+    })();
+    return () => { if (headSub) headSub.remove(); };
   }, []);
 
-  // 2. 위치 실시간 감시 및 Firebase 전송
+  // 세션 시작 후 백엔드 초기화
   useEffect(() => {
-    let active = true;
+    if (appState !== 'MAIN' || !userRole) return;
 
-    (async () => {
-      let { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') return;
+    const sessionToken = userRole === 'userA' ? myInviteCode : inputCode;
+    const partnerId = userRole === 'userA' ? 'userB' : 'userA';
+    const isHost = userRole === 'userA';
 
-      let initialLoc = await Location.getCurrentPositionAsync({ timeout: 5000 }).catch(() => null);
-      if (initialLoc && active) {
-        setMyLocation({ latitude: initialLoc.coords.latitude, longitude: initialLoc.coords.longitude });
+    const checkUWBTimeout = () => {
+      if (uwbActiveRef.current && Date.now() - lastUwbTimeRef.current > UWB_TIMEOUT_MS) {
+        uwbActiveRef.current = false;
+        uwbDistanceRef.current = null;
       }
+    };
 
-      if (appState === 'MAIN') {
-        if (locationSubscription.current) locationSubscription.current.remove();
-        if (headingSubscription.current) headingSubscription.current.remove();
+    const handleDistanceTransition = (dist: number) => {
+      if (!uwbActiveRef.current && dist < UWB_ENTER_THRESHOLD) {
+        uwbActiveRef.current = true;
+      } else if (uwbActiveRef.current && dist > UWB_EXIT_THRESHOLD) {
+        uwbActiveRef.current = false;
+        uwbDistanceRef.current = null;
+      }
+    };
 
-        locationSubscription.current = await Location.watchPositionAsync(
-          { accuracy: Location.Accuracy.High, distanceInterval: 1 },
-          (loc) => {
-            const currentPos: any = {
-              lat: loc.coords.latitude,
-              lon: loc.coords.longitude,
-              timestamp: Date.now()
-            };
-            setMyLocation({ latitude: currentPos.lat, longitude: currentPos.lon });
+    const handlePartnerNameDiscovery = (partnerName: string) => {
+      if (!partnerName) return;
+      setRecentFriends((prev) => {
+        const filtered = prev.filter(f => f.name !== partnerName);
+        return [{ id: String(Date.now()), name: partnerName, date: '방금 전' }, ...filtered].slice(0, 3);
+      });
+    };
 
-            const roomID = userRole === 'userA' ? myInviteCode : inputCode;
-            if (roomID && userRole) {
-              update(ref(db, `sessions/${roomID}/${userRole}`), currentPos).catch(e => console.log(e.message));
-            }
+    const init = async () => {
+      await requestPermission();
+      await requestBLEPermissions();
+
+      try { await startAdvertising(userRole); } catch (e) {}
+
+      // 라우터 구독
+      Session.subscribeRouters(sessionToken, (routers: any) => {
+        const arr = Object.values(routers).flatMap((router: any) => {
+          if (!router.relay) return [];
+          return Object.entries(router.relay).map(([_, relayData]: [string, any]) => ({
+            lat: router.lat, lon: router.lon,
+            rssi: relayData.rssi ?? -90,
+            targetLat: relayData.lat, targetLon: relayData.lon,
+          }));
+        });
+        routerDataRef.current = arr;
+      });
+
+      // UWB
+      startUWB(
+        sessionToken, userRole, partnerId,
+        ({ distance, azimuth }) => {
+          uwbDistanceRef.current = distance;
+          uwbAzimuthRef.current = azimuth ?? null;
+          uwbActiveRef.current = true;
+          lastUwbTimeRef.current = Date.now();
+        },
+        () => { uwbActiveRef.current = false; }
+      );
+
+      // 상대방 위치 및 실시간 이름 구독 연동
+      Session.subscribeToPartner(sessionToken, partnerId, (data: any) => {
+        if (data) {
+          partnerLocRef.current = { lat: data.lat, lon: data.lon };
+          setTargetLoc({ latitude: data.lat, longitude: data.lon });
+          if (data.name) handlePartnerNameDiscovery(data.name);
+        }
+      });
+
+      Session.subscribeRelayed(sessionToken, partnerId, (data: any) => {
+        if (data) {
+          partnerLocRef.current = { lat: data.lat, lon: data.lon };
+          setTargetLoc({ latitude: data.lat, longitude: data.lon });
+          if (data.name) handlePartnerNameDiscovery(data.name);
+        }
+      });
+
+      // 채팅 구독
+      const chatRef = ref(db, `sessions/${sessionToken}/chat`);
+      onValue(chatRef, (snapshot) => {
+        const data = snapshot.val();
+        if (data && data.timestamp !== lastMsgTimestamp.current) {
+          lastMsgTimestamp.current = data.timestamp;
+          setChatHistory(prev => [...prev, {
+            id: String(data.timestamp), sender: data.sender, text: data.text
+          }]);
+        }
+      });
+
+      if (isHost) {
+        watchLocation(async (loc) => {
+          setMyLocation({ latitude: loc.lat, longitude: loc.lon });
+          await Session.uploadLocation(sessionToken, userRole, loc.lat, loc.lon);
+
+          set(ref(db, `sessions/${sessionToken}/${userRole}/name`), myNameInput.trim());
+
+          if (partnerLocRef.current) {
+            checkUWBTimeout();
+            handleDistanceTransition(
+              // ★ 여기 내장 require 경로도 한 단계 더 위인 ../../로 수정 ★
+              require('../../services/bearing').getDistance(
+                loc.lat, loc.lon,
+                partnerLocRef.current.lat, partnerLocRef.current.lon
+              )
+            );
+
+            const result = calculatePosition({
+              myGpsPos: { lat: loc.lat, lon: loc.lon },
+              partnerGpsPos: partnerLocRef.current,
+              routers: routerDataRef.current,
+              uwbDistance: uwbActiveRef.current ? uwbDistanceRef.current : null,
+              uwbAzimuth: uwbAzimuthRef.current,
+            });
+
+            const finalDist = result.distance ?? 0;
+            setDistance(Math.round(finalDist));
+            await Session.uploadDistance(
+              sessionToken, finalDist,
+              result.bearing ?? 0, result.mode, result.confidence
+            );
+
+            if (finalDist <= 5 && finalDist > 0) setAppState('DONE');
           }
-        );
+        });
+      } else {
+        watchLocation(async (loc) => {
+          setMyLocation({ latitude: loc.lat, longitude: loc.lon });
+          await Session.uploadLocation(sessionToken, userRole, loc.lat, loc.lon);
 
-        headingSubscription.current = await Location.watchHeadingAsync((data) => {
-          setHeading(data.magHeading);
+          set(ref(db, `sessions/${sessionToken}/${userRole}/name`), myNameInput.trim());
+        });
+
+        Session.subscribeDistance(sessionToken, (data: any) => {
+          setDistance(Math.round(data.distance));
+          checkUWBTimeout();
+          handleDistanceTransition(data.distance);
+          if (data.distance <= 5) setAppState('DONE');
         });
       }
-    })();
-
-    return () => {
-      active = false;
-      if (locationSubscription.current) {
-        locationSubscription.current.remove();
-        locationSubscription.current = null;
-      }
-      if (headingSubscription.current) {
-        headingSubscription.current.remove();
-        headingSubscription.current = null;
-      }
     };
-  }, [appState, userRole, myInviteCode, inputCode]);
 
-  // 3. 상대방 위치 실시간 수신 및 ★진짜 이름 감지 후 최근 기록 누적★
-  useEffect(() => {
-    const roomID = userRole === 'userA' ? myInviteCode : inputCode;
-    if (!roomID || appState !== 'MAIN') return;
-
-    const otherUser = userRole === 'userA' ? 'userB' : 'userA';
-
-    const otherRef = ref(db, `sessions/${roomID}/${otherUser}`);
-    const unsubLocation = onValue(otherRef, (snapshot) => {
-      const data = snapshot.val();
-      if (data) {
-        if (data.lat && data.lon) {
-          setTargetLoc({ latitude: data.lat, longitude: data.lon });
-        }
-
-        // ★ 상대방이 입장해서 이름을 공유했다면 내 로컬 화면 기록(recentFriends)에 실시간 자동 누적 ★
-        if (data.name) {
-          setRecentFriends((prev) => {
-            // 이미 목록에 존재하는 이름이면 중복 추가 방지
-            if (prev.some(f => f.name === data.name)) return prev;
-            // 새 친구 목록에 맨 위로 쌓기
-            return [{ id: String(Date.now()), name: data.name, date: '방금 전' }, ...prev];
-          });
-        }
-      } else {
-        setTargetLoc(null);
-      }
-    });
-
-    const chatRef = ref(db, `sessions/${roomID}/chat`);
-    const unsubChat = onValue(chatRef, (snapshot) => {
-      const data = snapshot.val();
-      if (data && data.text && data.timestamp !== lastMsgTimestamp.current) {
-        lastMsgTimestamp.current = data.timestamp;
-        setChatHistory((prev) => [
-          ...prev,
-          { id: String(data.timestamp), sender: data.sender, text: data.text }
-        ]);
-      }
-    });
-
+    init();
     return () => {
-      unsubLocation();
-      unsubChat();
+      stopUWB();
+      stopAdvertising();
+      stopScanning();
     };
-  }, [appState, userRole, myInviteCode, inputCode]);
+  }, [appState, userRole]);
 
   const sendChatMessage = () => {
     if (!chatInput.trim()) return;
-    const roomID = userRole === 'userA' ? myInviteCode : inputCode;
-    if (roomID && userRole) {
-      const chatRef = ref(db, `sessions/${roomID}/chat`);
-      set(chatRef, {
-        sender: userRole,
-        text: chatInput.trim(),
-        timestamp: Date.now()
-      }).catch(e => console.log(e.message));
+    const sessionToken = userRole === 'userA' ? myInviteCode : inputCode;
+    if (sessionToken && userRole) {
+      set(ref(db, `sessions/${sessionToken}/chat`), {
+        sender: userRole, text: chatInput.trim(), timestamp: Date.now()
+      });
       setChatInput('');
     }
   };
-
-  // 4. 거리 계산
-  useEffect(() => {
-    if (myLocation && targetLoc) {
-      const R = 6371e3;
-      const φ1 = myLocation.latitude * Math.PI / 180;
-      const φ2 = targetLoc.latitude * Math.PI / 180;
-      const Δφ = (targetLoc.latitude - myLocation.latitude) * Math.PI / 180;
-      const Δλ = (targetLoc.longitude - myLocation.longitude) * Math.PI / 180;
-      const a = Math.sin(Δφ / 2) ** 2 + Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) ** 2;
-      const d = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-      setDistance(Math.round(d));
-      if (d <= 5 && d > 0) setAppState('DONE');
-    }
-  }, [myLocation, targetLoc]);
 
   const copyToClipboard = async () => {
     await Clipboard.setStringAsync(myInviteCode);
     Alert.alert("복사 완료", "초대 코드가 클립보드에 복사되었습니다.");
   };
 
-  // 방 생성 (내 이름 탑재)
   const createRoom = async () => {
     if (!myNameInput.trim()) return Alert.alert("확인", "사용하실 닉네임을 먼저 입력해주세요.");
-    if (!myLocation) return Alert.alert("알림", "위치 정보를 수신하는 중입니다. 잠시 후 다시 누르세요.");
+    if (!myLocation) return Alert.alert("위치 정보를 가져오는 중입니다.");
+
+    await Session.createSession(myInviteCode);
+    await set(ref(db, `sessions/${myInviteCode}/userA/name`), myNameInput.trim());
     setUserRole('userA');
-
-    try {
-      const userRef = ref(db, `sessions/${myInviteCode}/userA`);
-      await set(userRef, {
-        lat: myLocation.latitude,
-        lon: myLocation.longitude,
-        name: myNameInput.trim(), // 내 이름 업로드!
-        timestamp: Date.now(),
-        serverCreatedAt: serverTimestamp()
-      });
-      onDisconnect(userRef).remove();
-      setAppState('MAIN');
-    } catch (e) {
-      Alert.alert("에러", "Firebase Database 권한을 확인하세요.");
-    }
+    setAppState('MAIN');
   };
 
-  // 입장하기 (내 이름 탑재)
-  const joinRoom = async () => {
+  const joinRoom = (code?: string) => {
+    const finalCode = code || inputCode;
     if (!myNameInput.trim()) return Alert.alert("확인", "사용하실 닉네임을 먼저 입력해주세요.");
-    if (inputCode.length < 6) return Alert.alert("오류", "올바른 6자리 코드를 입력해주세요.");
-    setUserRole('userB');
+    if (finalCode.length < 6) return Alert.alert("올바른 코드를 입력해주세요.");
 
-    try {
-      const userRef = ref(db, `sessions/${inputCode}/userB`);
-      await set(userRef, {
-        lat: myLocation ? myLocation.latitude : KOREA_CENTER.latitude,
-        lon: myLocation ? myLocation.longitude : KOREA_CENTER.longitude,
-        name: myNameInput.trim(), // 내 이름 업로드!
-        timestamp: Date.now()
-      });
-      onDisconnect(userRef).remove();
-      setAppState('MAIN');
-    } catch (e) {
-      Alert.alert("오류", "방 입장에 실패했습니다.");
-    }
+    if (code) setInputCode(code);
+    set(ref(db, `sessions/${finalCode}/userB/name`), myNameInput.trim());
+    setUserRole('userB');
+    setAppState('MAIN');
   };
 
-  // 종료 (최근 친구 목록은 파괴하지 않고 유지)
   const exitSession = async () => {
-    if (locationSubscription.current) {
-      locationSubscription.current.remove();
-      locationSubscription.current = null;
-    }
-    if (headingSubscription.current) {
-      headingSubscription.current.remove();
-      headingSubscription.current = null;
-    }
-
-    const roomID = userRole === 'userA' ? myInviteCode : inputCode;
-    if (roomID && userRole) {
-      await remove(ref(db, `sessions/${roomID}`)).catch(e => console.log(e.message));
-    }
-
+    const sessionToken = userRole === 'userA' ? myInviteCode : inputCode;
+    await Session.endSession(sessionToken);
+    stopUWB();
+    stopAdvertising();
     setAppState('TOKEN');
     setUserRole(null);
     setTargetLoc(null);
@@ -295,7 +298,6 @@ export default function Index() {
         <ScrollView contentContainerStyle={styles.tokenContainer}>
           <Text style={styles.mainTitle}>위치 공유 시작</Text>
 
-          {/* ★ 심플 UI 디자인: 맨 상단에 배치된 내 닉네임 설정 칸 ★ */}
           <View style={styles.nameSetupCard}>
             <Text style={styles.nameSetupLabel}>나의 닉네임 설정</Text>
             <TextInput
@@ -318,7 +320,6 @@ export default function Index() {
               <Text style={styles.mainStartBtnText}>방 생성하고 공유 시작</Text>
             </TouchableOpacity>
           </View>
-
           <View style={styles.shareOptions}>
             <TouchableOpacity style={[styles.shareBtn, { backgroundColor: '#FEE500' }]} onPress={() => Alert.alert("공유", "카카오톡 전송")}>
               <Text style={styles.shareBtnText}>카카오톡</Text>
@@ -330,18 +331,16 @@ export default function Index() {
               <Text style={[styles.shareBtnText, { color: '#fff' }]}>링크 복사</Text>
             </TouchableOpacity>
           </View>
-
           <View style={styles.joinSection}>
             <Text style={styles.sectionLabel}>초대 코드로 입장 (게스트)</Text>
             <View style={styles.joinInputRow}>
               <TextInput style={styles.joinInput} placeholder="6자리 코드 입력" value={inputCode} onChangeText={setInputCode} maxLength={6} autoCapitalize="characters" />
-              <TouchableOpacity style={styles.joinBtn} onPress={joinRoom}><Text style={{color: '#fff', fontWeight: 'bold'}}>입장</Text></TouchableOpacity>
+              <TouchableOpacity style={styles.joinBtn} onPress={() => joinRoom()}><Text style={{color: '#fff', fontWeight: 'bold'}}>입장</Text></TouchableOpacity>
             </View>
           </View>
 
-          {/* ★ 최근 함께한 친구 섹션: 처음엔 비어있다가 연동 시 동적 렌더링 ★ */}
           <View style={styles.recentSection}>
-            <Text style={styles.sectionLabel}>최근 함께한 친구</Text>
+            <Text style={styles.sectionLabel}>최근 함께한 친구 (최대 3명)</Text>
             {recentFriends.length > 0 ? (
               recentFriends.map(friend => (
                 <View key={friend.id} style={styles.friendItem}>
@@ -350,7 +349,7 @@ export default function Index() {
                     <Text style={styles.friendName}>{friend.name}</Text>
                     <Text style={styles.friendDate}>{friend.date}</Text>
                   </View>
-                  <View style={styles.statusBadge}><Text style={styles.statusBadgeText}>기록됨 ✓</Text></View>
+                  <View style={styles.statusBadge}><Text style={styles.statusBadgeText}>최근 ✓</Text></View>
                 </View>
               ))
             ) : (
@@ -360,6 +359,18 @@ export default function Index() {
             )}
           </View>
         </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
+  if (appState === 'DONE') {
+    return (
+      <SafeAreaView style={[styles.safeArea, { justifyContent: 'center', alignItems: 'center' }]}>
+        <Text style={{ fontSize: 80 }}>🎉</Text>
+        <Text style={{ fontSize: 24, fontWeight: 'bold', marginTop: 20 }}>만났어요!</Text>
+        <TouchableOpacity style={[styles.mainStartBtn, { marginTop: 40, width: 200 }]} onPress={exitSession}>
+          <Text style={styles.mainStartBtnText}>종료</Text>
+        </TouchableOpacity>
       </SafeAreaView>
     );
   }
@@ -427,7 +438,6 @@ export default function Index() {
                 <Text style={styles.glassCloseBtnText}>접기 ✕</Text>
               </TouchableOpacity>
             </View>
-
             <FlatList
               ref={flatListRef}
               data={chatHistory}
@@ -447,7 +457,6 @@ export default function Index() {
               }}
               ListEmptyComponent={<Text style={styles.emptyGlassText}>리퀴드 글래스 대화방이 활성화되었습니다.</Text>}
             />
-
             <View style={styles.glassInputArea}>
               <TextInput
                 style={styles.glassTextInput}
@@ -487,8 +496,7 @@ const styles = StyleSheet.create({
   tokenContainer: { padding: 24 },
   mainTitle: { fontSize: 24, fontWeight: 'bold', marginBottom: 20, marginTop: 20 },
 
-  // 닉네임 입력 컴포넌트 카드 디자인
-  nameSetupCard: { backgroundColor: '#F3F4F6', padding: 16, borderRadius: 16, borderHorizontal: 1, borderColor: '#E5E7EB', marginBottom: 24 },
+  nameSetupCard: { backgroundColor: '#F3F4F6', padding: 16, borderRadius: 16, borderWidth: 1, borderColor: '#E5E7EB', marginBottom: 24 },
   nameSetupLabel: { fontSize: 13, fontWeight: '700', color: '#4B5563', marginBottom: 6 },
   nameSetupInput: { backgroundColor: '#FFFFFF', borderWidth: 1, borderColor: '#D1D5DB', borderRadius: 10, paddingHorizontal: 14, height: 44, fontSize: 14, color: '#111827' },
 
@@ -507,7 +515,6 @@ const styles = StyleSheet.create({
   joinInput: { flex: 1, backgroundColor: '#F9FAFB', borderWidth: 1, borderColor: '#E5E7EB', borderRadius: 12, paddingHorizontal: 16, fontSize: 16 },
   joinBtn: { backgroundColor: '#111827', paddingHorizontal: 24, justifyContent: 'center', alignItems: 'center', borderRadius: 12 },
 
-  // 친구 목록 UI 구조화
   recentSection: { flex: 1, marginTop: 10, paddingBottom: 40 },
   friendItem: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#FFF', padding: 14, borderRadius: 16, marginBottom: 12, borderWidth: 1, borderColor: '#E5E7EB' },
   friendProfile: { width: 40, height: 40, borderRadius: 20, backgroundColor: '#EFF6FF', justifyContent: 'center', alignItems: 'center', marginRight: 12 },
@@ -525,10 +532,10 @@ const styles = StyleSheet.create({
   activeGlassTab: { backgroundColor: '#fff' },
   glassTabText: { fontSize: 14, color: '#666', fontWeight: '600' },
   activeGlassTabText: { color: '#2563EB' },
-  floatingChatBtn: { position: 'absolute', bottom: 110, right: 20, backgroundColor: '#111827', paddingHorizontal: 20, paddingVertical: 12, borderRadius: 25, zIndex: 10 },
+  floatingChatBtn: { position: 'absolute', bottom: 110, right: 20, backgroundColor: '#111827', paddingHorizontal: 20, paddingVertical: 12, borderRadius: 25, elevation: 10, shadowColor: '#000', shadowOpacity: 0.2, shadowRadius: 10 },
   floatingChatBtnText: { color: '#fff', fontWeight: 'bold' },
   glassChatOverlay: { position: 'absolute', bottom: 0, left: 0, right: 0, height: height * 0.45, zIndex: 999 },
-  liquidGlassPanel: { flex: 1, backgroundColor: 'rgba(255, 255, 255, 0.85)', borderTopLeftRadius: 35, borderTopRightRadius: 35, borderWidth: 1.5, borderColor: 'rgba(255, 255, 255, 0.5)' },
+  liquidGlassPanel: { flex: 1, backgroundColor: 'rgba(255, 255, 255, 0.85)', borderTopLeftRadius: 35, borderTopRightRadius: 35, borderWidth: 1.5, borderColor: 'rgba(255, 255, 255, 0.5)', shadowColor: '#000', shadowOpacity: 0.1, shadowRadius: 20 },
   glassHeader: { padding: 15, alignItems: 'center', marginBottom: 5 },
   glassHandle: { width: 40, height: 5, backgroundColor: 'rgba(0,0,0,0.1)', borderRadius: 10, marginBottom: 10 },
   glassCloseBtn: { position: 'absolute', right: 20, top: 15 },
@@ -547,7 +554,7 @@ const styles = StyleSheet.create({
   glassTextInput: { flex: 1, backgroundColor: 'rgba(255, 255, 255, 0.8)', height: 48, borderRadius: 24, paddingHorizontal: 20, borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.5)' },
   glassSendBtn: { marginLeft: 10, backgroundColor: '#111827', paddingHorizontal: 20, borderRadius: 24, justifyContent: 'center' },
   glassSendBtnText: { color: '#fff', fontWeight: 'bold' },
-  minimalBottomBar: { position: 'absolute', bottom: 30, left: 20, right: 20, height: 70, backgroundColor: 'rgba(255, 255, 255, 0.9)', borderRadius: 20, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 20, borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.5)' },
+  minimalBottomBar: { position: 'absolute', bottom: 30, left: 20, right: 20, height: 70, backgroundColor: 'rgba(255, 255, 255, 0.9)', borderRadius: 20, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 20, borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.5)', shadowColor: '#000', shadowOpacity: 0.05, shadowRadius: 10 },
   miniInfo: { flex: 1 },
   miniLabel: { fontSize: 10, color: '#999', fontWeight: 'bold' },
   miniValue: { fontSize: 20, fontWeight: 'bold', color: '#2563EB' },
@@ -559,6 +566,6 @@ const styles = StyleSheet.create({
   arrowWrapper: { alignItems: 'center', justifyContent: 'center' },
   arrowHead: { width: 0, height: 0, borderLeftWidth: 30, borderLeftColor: 'transparent', borderRightWidth: 30, borderRightColor: 'transparent', borderBottomWidth: 45, borderBottomColor: '#2563EB' },
   arrowStem: { width: 22, height: 45, backgroundColor: '#2563EB', marginTop: -5 },
-  simpleMarker: { width: 60, height: 60, alignItems: 'center', justifyContent: 'center', backgroundColor: 'transparent' },
-  dotCore: { width: 18, height: 18, borderRadius: 9, borderWidth: 3, borderColor: '#FFFFFF', elevation: 6 }
+  simpleMarker: { width: 60, height: 60, alignItems: 'center', justifyContent: 'center' },
+  dotCore: { width: 18, height: 18, borderRadius: 9, borderWidth: 3, borderColor: '#FFFFFF', elevation: 6 },
 });
