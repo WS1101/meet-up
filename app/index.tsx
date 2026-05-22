@@ -1,213 +1,94 @@
-import { get, ref } from 'firebase/database';
-import { useEffect, useRef, useState } from 'react';
-import { Platform, Text, TouchableOpacity, View } from 'react-native';
+import React, { useState, useEffect, useRef } from 'react';
+import { StyleSheet, Text, View, TouchableOpacity, Dimensions, StatusBar, SafeAreaView, ScrollView, Alert, TextInput, KeyboardAvoidingView, Platform, FlatList } from 'react-native';
+import MapView, { Marker, Polyline, PROVIDER_GOOGLE } from 'react-native-maps';
+import * as Clipboard from 'expo-clipboard';
+import { ref, set, onValue } from 'firebase/database';
 import { db } from '../firebase/config';
-import { getBearing, getDistance } from '../services/bearing';
+
+// 우리 백엔드 서비스
 import { requestPermission, watchLocation } from '../services/location';
 import * as Session from '../services/session';
 import { calculatePosition } from '../services/positioning';
 import { startUWB, stopUWB, UWB_ENTER_THRESHOLD, UWB_EXIT_THRESHOLD } from '../services/uwb';
 import {
-  requestBLEPermissions,
-  startAdvertising,
-  stopAdvertising,
-  startScanning,
-  stopScanning,
-  rssiToDistance,
+  requestBLEPermissions, startAdvertising, stopAdvertising,
+  startScanning, stopScanning, rssiToDistance,
 } from '../services/ble';
 
-const SESSION_TOKEN = 'TEST001';
-const UWB_DIRECTION_THRESHOLD = 10;
+const { width, height } = Dimensions.get('window');
 const UWB_TIMEOUT_MS = 3000;
 
-function bearingToArrow(bearing: number): string {
-  const arrows = ['↑','↗','→','↘','↓','↙','←','↖'];
-  return arrows[Math.round(bearing / 45) % 8];
-}
+const COLORS = {
+  bg: '#FFFFFF', surface: '#F9FAFB', border: '#E5E7EB',
+  text: '#111827', textSecondary: '#6B7280',
+  primary: '#2563EB', accent: '#F97316',
+};
 
-type AppMode = 'select' | 'user' | 'router';
-type LocationMode = 'gps' | 'uwb';
-type DirectionMode = 'gps_bearing' | 'uwb_azimuth';
+const refinedMapStyle = [{ "elementType": "geometry", "stylers": [{ "color": "#f5f5f5" }] }, { "featureType": "road", "elementType": "geometry", "stylers": [{ "color": "#ffffff" }] }, { "featureType": "water", "elementType": "geometry", "stylers": [{ "color": "#d2e5f9" }] }, { "featureType": "poi", "stylers": [{ "visibility": "off" }] }];
 
-export default function HomeScreen() {
-  const [appMode, setAppMode] = useState<AppMode>('select');
+export default function Index() {
+  const [appState, setAppState] = useState<'TOKEN' | 'MAIN' | 'DONE'>('TOKEN');
+  const [activeTab, setActiveTab] = useState<'MAP' | 'ARROW'>('MAP');
+  const [distance, setDistance] = useState(0);
+  const [heading, setHeading] = useState(0);
+  const [myLocation, setMyLocation] = useState<any>(null);
+  const [targetLoc, setTargetLoc] = useState<any>(null);
+  const [myInviteCode, setMyInviteCode] = useState<string>('');
+  const [inputCode, setInputCode] = useState<string>('');
+  const [userRole, setUserRole] = useState<'userA' | 'userB' | null>(null);
+  const [trackChanges, setTrackChanges] = useState(true);
+  const [isChatOpen, setIsChatOpen] = useState(false);
+  const [chatInput, setChatInput] = useState<string>('');
+  const [chatHistory, setChatHistory] = useState<any[]>([]);
+  const flatListRef = useRef<FlatList>(null);
+  const lastMsgTimestamp = useRef<number>(0);
 
-  if (appMode === 'select') {
-    return (
-      <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', gap: 20, padding: 32, backgroundColor: '#f5f5f5' }}>
-        <Text style={{ fontSize: 24, fontWeight: 'bold' }}>역할 선택</Text>
-        <Text style={{ color: '#888' }}>세션: {SESSION_TOKEN}</Text>
+  const [recentFriends] = useState([
+    { id: 1, name: '김철수', date: '방금 전' },
+    { id: 2, name: '이영희', date: '2일 전' },
+  ]);
 
-        <TouchableOpacity
-          style={{ backgroundColor: '#2255ff', padding: 24, borderRadius: 16, width: '100%', alignItems: 'center' }}
-          onPress={() => setAppMode('user')}
-        >
-          <Text style={{ color: '#fff', fontSize: 20, fontWeight: 'bold' }}>👤 일반 유저</Text>
-          <Text style={{ color: '#adf', marginTop: 4 }}>위치 공유 + 상대방 찾기</Text>
-        </TouchableOpacity>
-
-        <TouchableOpacity
-          style={{ backgroundColor: '#22aa55', padding: 24, borderRadius: 16, width: '100%', alignItems: 'center' }}
-          onPress={() => setAppMode('router')}
-        >
-          <Text style={{ color: '#fff', fontSize: 20, fontWeight: 'bold' }}>📡 라우터</Text>
-          <Text style={{ color: '#afd', marginTop: 4 }}>BLE 중계 (신호 정확도 향상)</Text>
-        </TouchableOpacity>
-      </View>
-    );
-  }
-
-  if (appMode === 'router') return <RouterMode sessionToken={SESSION_TOKEN} />;
-  return <UserMode sessionToken={SESSION_TOKEN} />;
-}
-
-// ── 라우터 모드 ──────────────────────────────
-function RouterMode({ sessionToken }: { sessionToken: string }) {
-  const [status, setStatus] = useState('시작중...');
-  const [bleDevices, setBleDevices] = useState<Record<string, { rssi: number; distance: number }>>({});
-  const [relayCount, setRelayCount] = useState(0);
-  const [myLoc, setMyLoc] = useState<{ lat: number; lon: number } | null>(null);
-
-  const routerId = useRef(`router_${Date.now()}`);
-  const myLocRef = useRef<{ lat: number; lon: number } | null>(null);
-  const userLocsRef = useRef<Record<string, { lat: number; lon: number }>>({});
-
-  useEffect(() => {
-    const start = async () => {
-      const bleOk = await requestBLEPermissions();
-      if (!bleOk) { setStatus('BLE 권한 없음'); return; }
-
-      await requestPermission();
-
-      watchLocation(async (loc) => {
-        myLocRef.current = loc;
-        setMyLoc(loc);
-        await Session.registerRouter(sessionToken, routerId.current, loc.lat, loc.lon);
-      });
-
-      ['userA', 'userB'].forEach(userId => {
-        Session.subscribeToPartner(sessionToken, userId, (data: any) => {
-          userLocsRef.current[userId] = { lat: data.lat, lon: data.lon };
-        });
-      });
-
-      startScanning(async (userId, rssi) => {
-        const distance = rssiToDistance(rssi);
-        setBleDevices(prev => ({ ...prev, [userId]: { rssi, distance } }));
-
-        const userLoc = userLocsRef.current[userId];
-        if (userLoc && myLocRef.current) {
-          await Session.relayLocation(
-            sessionToken,
-            routerId.current,
-            userId,
-            userLoc.lat,
-            userLoc.lon,
-            rssi
-          );
-          setRelayCount(c => c + 1);
-          setStatus('BLE 중계 중 ✅');
-        }
-      });
-
-      setStatus('BLE 스캔 중...');
-    };
-
-    start();
-    return () => { stopScanning(); };
-  }, []);
-
-  return (
-    <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', gap: 16, padding: 20, backgroundColor: '#0a1a0a' }}>
-      <Text style={{ fontSize: 60 }}>📡</Text>
-      <Text style={{ fontSize: 24, fontWeight: 'bold', color: '#4f4' }}>라우터 모드</Text>
-      <Text style={{ color: '#aaa' }}>{status}</Text>
-
-      <View style={{ backgroundColor: '#111', padding: 16, borderRadius: 12, width: '100%' }}>
-        <Text style={{ color: '#4f4', fontWeight: 'bold', marginBottom: 8 }}>BLE 감지 현황</Text>
-        {Object.entries(bleDevices).map(([userId, data]) => (
-          <Text key={userId} style={{ color: '#aaa' }}>
-            {userId}: {data.rssi}dBm → {data.distance.toFixed(1)}m
-          </Text>
-        ))}
-        {Object.keys(bleDevices).length === 0 && (
-          <Text style={{ color: '#555' }}>감지된 기기 없음</Text>
-        )}
-        <Text style={{ color: '#888', marginTop: 8 }}>총 중계 횟수: {relayCount}</Text>
-      </View>
-
-      {myLoc && (
-        <View style={{ backgroundColor: '#111', padding: 16, borderRadius: 12, width: '100%' }}>
-          <Text style={{ color: '#4f4', fontWeight: 'bold' }}>내 위치</Text>
-          <Text style={{ color: '#aaa' }}>{myLoc.lat.toFixed(5)}, {myLoc.lon.toFixed(5)}</Text>
-        </View>
-      )}
-    </View>
-  );
-}
-
-// ── 일반 유저 모드 ──────────────────────────────
-function UserMode({ sessionToken }: { sessionToken: string }) {
-  const [myId, setMyId] = useState('');
-  const [gpsDistance, setGpsDistance] = useState<number | null>(null);
-  const [uwbDistance, setUwbDistance] = useState<number | null>(null);
-  const [gpsBearing, setGpsBearing] = useState<number | null>(null);
-  const [uwbAzimuth, setUwbAzimuth] = useState<number | null>(null);
-  const [distanceMode, setDistanceMode] = useState<LocationMode>('gps');
-  const [directionMode, setDirectionMode] = useState<DirectionMode>('gps_bearing');
-  const [routerCount, setRouterCount] = useState(0);
-  const [posMode, setPosMode] = useState<string>('gps');
-  const [confidence, setConfidence] = useState(0);
-
-  const partnerLocRef = useRef<{ lat: number; lon: number } | null>(null);
+  // 백엔드 refs
+  const partnerLocRef = useRef<any>(null);
   const uwbActiveRef = useRef(false);
   const lastUwbTimeRef = useRef<number>(0);
   const uwbDistanceRef = useRef<number | null>(null);
-  const gpsDistanceRef = useRef<number | null>(null);
-  const gpsBearingRef = useRef<number | null>(null);
   const uwbAzimuthRef = useRef<number | null>(null);
   const routerDataRef = useRef<any[]>([]);
 
+  const KOREA_CENTER = { latitude: 37.5564, longitude: 126.9723 };
+
+  const generateInviteCode = () => {
+    const token = Session.createToken();
+    setMyInviteCode(token);
+  };
+
+  useEffect(() => { generateInviteCode(); }, []);
+
+  // 나침반
   useEffect(() => {
-    const assignId = async () => {
-      const snapshot = await get(ref(db, `sessions/${sessionToken}/userA`));
-      setMyId(!snapshot.exists() ? 'userA' : 'userB');
-    };
-    assignId();
+    let headSub: any;
+    (async () => {
+      const Location = require('expo-location');
+      headSub = await Location.watchHeadingAsync((data: any) => {
+        setHeading(data.magHeading);
+      });
+    })();
+    return () => { if (headSub) headSub.remove(); };
   }, []);
 
+  // 세션 시작 후 백엔드 초기화
   useEffect(() => {
-    if (!myId) return;
-    const partnerId = myId === 'userA' ? 'userB' : 'userA';
-    const isHost = myId === 'userA';
+    if (appState !== 'MAIN' || !userRole) return;
 
-    const uploadCurrentStatus = async () => {
-      const uwbDist = uwbDistanceRef.current;
-      const gpsDist = gpsDistanceRef.current;
-      const dMode: LocationMode = uwbActiveRef.current && uwbDist !== null ? 'uwb' : 'gps';
-      const dirMode: DirectionMode = (uwbDist !== null && uwbDist < UWB_DIRECTION_THRESHOLD)
-        ? 'uwb_azimuth' : 'gps_bearing';
-      setDistanceMode(dMode);
-      setDirectionMode(dirMode);
-
-      const status: Record<string, any> = {
-        distanceMode: dMode,
-        directionMode: dirMode,
-        platform: Platform.OS,
-      };
-      if (gpsDist !== null) status.gpsDistance = gpsDist;
-      if (uwbDist !== null) status.uwbDistance = uwbDist;
-      if (gpsBearingRef.current !== null) status.gpsBearing = gpsBearingRef.current;
-      if (uwbAzimuthRef.current !== null) status.uwbAzimuth = uwbAzimuthRef.current;
-      await Session.uploadStatus(sessionToken, myId, status);
-    };
+    const sessionToken = userRole === 'userA' ? myInviteCode : inputCode;
+    const partnerId = userRole === 'userA' ? 'userB' : 'userA';
+    const isHost = userRole === 'userA';
 
     const checkUWBTimeout = () => {
       if (uwbActiveRef.current && Date.now() - lastUwbTimeRef.current > UWB_TIMEOUT_MS) {
-        console.log('UWB 타임아웃 → GPS 모드');
         uwbActiveRef.current = false;
         uwbDistanceRef.current = null;
-        setUwbDistance(null);
       }
     };
 
@@ -217,81 +98,77 @@ function UserMode({ sessionToken }: { sessionToken: string }) {
       } else if (uwbActiveRef.current && dist > UWB_EXIT_THRESHOLD) {
         uwbActiveRef.current = false;
         uwbDistanceRef.current = null;
-        setUwbDistance(null);
       }
     };
 
-    const start = async () => {
-      await Session.testConnection();
+    const init = async () => {
       await requestPermission();
       await requestBLEPermissions();
 
-      try {
-        await startAdvertising(myId);
-      } catch (e) {
-        console.log('BLE 광고 실패:', e);
-      }
+      try { await startAdvertising(userRole); } catch (e) {}
 
+      // 라우터 구독
       Session.subscribeRouters(sessionToken, (routers: any) => {
-        const routerDataArray = Object.values(routers).flatMap((router: any) => {
+        const arr = Object.values(routers).flatMap((router: any) => {
           if (!router.relay) return [];
-          return Object.entries(router.relay).map(([userId, relayData]: [string, any]) => ({
-            lat: router.lat,
-            lon: router.lon,
+          return Object.entries(router.relay).map(([_, relayData]: [string, any]) => ({
+            lat: router.lat, lon: router.lon,
             rssi: relayData.rssi ?? -90,
-            targetLat: relayData.lat,
-            targetLon: relayData.lon,
+            targetLat: relayData.lat, targetLon: relayData.lon,
           }));
         });
-        routerDataRef.current = routerDataArray;
-        setRouterCount(Object.keys(routers).length);
+        routerDataRef.current = arr;
       });
 
+      // UWB
       startUWB(
-        sessionToken, myId, partnerId,
+        sessionToken, userRole, partnerId,
         ({ distance, azimuth }) => {
           uwbDistanceRef.current = distance;
           uwbAzimuthRef.current = azimuth ?? null;
-          setUwbDistance(distance);
-          setUwbAzimuth(azimuth ?? null);
           uwbActiveRef.current = true;
           lastUwbTimeRef.current = Date.now();
-          uploadCurrentStatus();
         },
-        () => {
-          uwbActiveRef.current = false;
-          uploadCurrentStatus();
-        }
+        () => { uwbActiveRef.current = false; }
       );
 
+      // 상대방 위치 구독
       Session.subscribeToPartner(sessionToken, partnerId, (data: any) => {
         partnerLocRef.current = { lat: data.lat, lon: data.lon };
+        setTargetLoc({ latitude: data.lat, longitude: data.lon });
       });
 
       Session.subscribeRelayed(sessionToken, partnerId, (data: any) => {
         partnerLocRef.current = { lat: data.lat, lon: data.lon };
+        setTargetLoc({ latitude: data.lat, longitude: data.lon });
+      });
+
+      // 채팅 구독
+      const chatRef = ref(db, `sessions/${sessionToken}/chat`);
+      onValue(chatRef, (snapshot) => {
+        const data = snapshot.val();
+        if (data && data.timestamp !== lastMsgTimestamp.current) {
+          lastMsgTimestamp.current = data.timestamp;
+          setChatHistory(prev => [...prev, {
+            id: String(data.timestamp), sender: data.sender, text: data.text
+          }]);
+        }
       });
 
       if (isHost) {
         watchLocation(async (loc) => {
-          await Session.uploadLocation(sessionToken, myId, loc.lat, loc.lon);
+          setMyLocation({ latitude: loc.lat, longitude: loc.lon });
+          await Session.uploadLocation(sessionToken, userRole, loc.lat, loc.lon);
 
           if (partnerLocRef.current) {
-            const dist = getDistance(loc.lat, loc.lon, partnerLocRef.current.lat, partnerLocRef.current.lon);
-            const bear = getBearing(loc.lat, loc.lon, partnerLocRef.current.lat, partnerLocRef.current.lon);
-
-            gpsDistanceRef.current = dist;
-            gpsBearingRef.current = bear;
-            setGpsDistance(dist);
-            setGpsBearing(bear);
-
-            // UWB 타임아웃 체크
             checkUWBTimeout();
+            handleDistanceTransition(
+              require('../services/bearing').getDistance(
+                loc.lat, loc.lon,
+                partnerLocRef.current.lat, partnerLocRef.current.lon
+              )
+            );
 
-            // GPS/UWB 전환
-            handleDistanceTransition(dist);
-
-            // calculatePosition으로 최종 거리 계산
             const result = calculatePosition({
               myGpsPos: { lat: loc.lat, lon: loc.lon },
               partnerGpsPos: partnerLocRef.current,
@@ -300,79 +177,344 @@ function UserMode({ sessionToken }: { sessionToken: string }) {
               uwbAzimuth: uwbAzimuthRef.current,
             });
 
-            setPosMode(result.mode);
-            setConfidence(result.confidence);
+            const finalDist = result.distance ?? 0;
+            setDistance(Math.round(finalDist));
+            await Session.uploadDistance(
+              sessionToken, finalDist,
+              result.bearing ?? 0, result.mode, result.confidence
+            );
 
-            const finalDist = result.distance ?? dist;
-            const finalBear = result.bearing ?? bear;
-            await Session.uploadDistance(sessionToken, finalDist, finalBear, result.mode, result.confidence);
-            await uploadCurrentStatus();
+            if (finalDist <= 5 && finalDist > 0) setAppState('DONE');
           }
         });
       } else {
         watchLocation(async (loc) => {
-          await Session.uploadLocation(sessionToken, myId, loc.lat, loc.lon);
+          setMyLocation({ latitude: loc.lat, longitude: loc.lon });
+          await Session.uploadLocation(sessionToken, userRole, loc.lat, loc.lon);
         });
 
         Session.subscribeDistance(sessionToken, (data: any) => {
-          if (data.mode) setPosMode(data.mode);
-          if (data.confidence !== undefined) setConfidence(data.confidence);
-          gpsDistanceRef.current = data.distance;
-          gpsBearingRef.current = data.bearing;
-          setGpsDistance(data.distance);
-          setGpsBearing(data.bearing);
-
-          // UWB 타임아웃 체크
+          setDistance(Math.round(data.distance));
           checkUWBTimeout();
-
-          // GPS/UWB 전환
           handleDistanceTransition(data.distance);
-
-          uploadCurrentStatus();
+          if (data.distance <= 5) setAppState('DONE');
         });
       }
     };
 
-    start();
+    init();
     return () => {
       stopUWB();
       stopAdvertising();
+      stopScanning();
     };
-  }, [myId]);
+  }, [appState, userRole]);
 
-  const displayDistance = distanceMode === 'uwb' ? uwbDistance : gpsDistance;
-  const displayBearing = directionMode === 'uwb_azimuth' ? uwbAzimuth : gpsBearing;
-  const arrow = displayBearing !== null ? bearingToArrow(displayBearing) : '?';
+  const sendChatMessage = () => {
+    if (!chatInput.trim()) return;
+    const sessionToken = userRole === 'userA' ? myInviteCode : inputCode;
+    if (sessionToken && userRole) {
+      set(ref(db, `sessions/${sessionToken}/chat`), {
+        sender: userRole, text: chatInput.trim(), timestamp: Date.now()
+      });
+      setChatInput('');
+    }
+  };
 
+  const copyToClipboard = async () => {
+    await Clipboard.setStringAsync(myInviteCode);
+    Alert.alert("복사 완료", "초대 코드가 클립보드에 복사되었습니다.");
+  };
+
+  const createRoom = async () => {
+    if (!myLocation) return Alert.alert("위치 정보를 가져오는 중입니다.");
+    await Session.createSession(myInviteCode);
+    setUserRole('userA');
+    setAppState('MAIN');
+  };
+
+  const joinRoom = (code?: string) => {
+    const finalCode = code || inputCode;
+    if (finalCode.length < 6) return Alert.alert("올바른 코드를 입력해주세요.");
+    if (code) setInputCode(code);
+    setUserRole('userB');
+    setAppState('MAIN');
+  };
+
+  const exitSession = async () => {
+    const sessionToken = userRole === 'userA' ? myInviteCode : inputCode;
+    await Session.endSession(sessionToken);
+    stopUWB();
+    stopAdvertising();
+    setAppState('TOKEN');
+    setUserRole(null);
+    setTargetLoc(null);
+    setDistance(0);
+    setChatHistory([]);
+    lastMsgTimestamp.current = 0;
+    setIsChatOpen(false);
+    generateInviteCode();
+  };
+
+  const bearing = (start: any, end: any) => {
+    if (!start || !end) return 0;
+    const startLat = start.latitude * Math.PI / 180;
+    const endLat = end.latitude * Math.PI / 180;
+    const dLng = (end.longitude - start.longitude) * Math.PI / 180;
+    const y = Math.sin(dLng) * Math.cos(endLat);
+    const x = Math.cos(startLat) * Math.sin(endLat) - Math.sin(startLat) * Math.cos(endLat) * Math.cos(dLng);
+    return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+  };
+
+  const arrowRotation = (bearing(myLocation || KOREA_CENTER, targetLoc) - heading + 360) % 360;
+
+  // ── TOKEN 화면 (팀원 UI 그대로) ──
+  if (appState === 'TOKEN') {
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <ScrollView contentContainerStyle={styles.tokenContainer}>
+          <Text style={styles.mainTitle}>위치 공유 시작</Text>
+          <View style={styles.codeSection}>
+            <Text style={styles.sectionLabel}>나의 공유 코드 (방장)</Text>
+            <TouchableOpacity style={styles.codeCard} onPress={copyToClipboard}>
+              <Text style={styles.codeText}>{myInviteCode || '------'}</Text>
+              <Text style={styles.copyHint}>터치하여 복사</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.mainStartBtn} onPress={createRoom}>
+              <Text style={styles.mainStartBtnText}>방 생성하고 공유 시작</Text>
+            </TouchableOpacity>
+          </View>
+          <View style={styles.shareOptions}>
+            <TouchableOpacity style={[styles.shareBtn, { backgroundColor: '#FEE500' }]} onPress={() => Alert.alert("공유", "카카오톡 전송")}>
+              <Text style={styles.shareBtnText}>카카오톡</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={[styles.shareBtn, { backgroundColor: '#E5E7EB' }]} onPress={() => Alert.alert("공유", "문자 전송")}>
+              <Text style={styles.shareBtnText}>문자</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={[styles.shareBtn, { backgroundColor: COLORS.primary }]} onPress={copyToClipboard}>
+              <Text style={[styles.shareBtnText, { color: '#fff' }]}>링크 복사</Text>
+            </TouchableOpacity>
+          </View>
+          <View style={styles.joinSection}>
+            <Text style={styles.sectionLabel}>초대 코드로 입장 (게스트)</Text>
+            <View style={styles.joinInputRow}>
+              <TextInput style={styles.joinInput} placeholder="6자리 코드 입력" value={inputCode} onChangeText={setInputCode} maxLength={6} autoCapitalize="characters" />
+              <TouchableOpacity style={styles.joinBtn} onPress={() => joinRoom()}><Text style={{color: '#fff', fontWeight: 'bold'}}>입장</Text></TouchableOpacity>
+            </View>
+          </View>
+          <View style={styles.recentSection}>
+            <Text style={styles.sectionLabel}>최근 함께한 친구</Text>
+            {recentFriends.map(friend => (
+              <TouchableOpacity key={friend.id} style={styles.friendItem} onPress={() => joinRoom('TEST01')}>
+                <View style={styles.friendProfile}><Text style={styles.friendInitial}>{friend.name[0]}</Text></View>
+                <View style={styles.friendInfo}>
+                  <Text style={styles.friendName}>{friend.name}</Text>
+                  <Text style={styles.friendDate}>{friend.date}</Text>
+                </View>
+                <Text style={styles.startText}>시작 ›</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
+  // ── DONE 화면 ──
+  if (appState === 'DONE') {
+    return (
+      <SafeAreaView style={[styles.safeArea, { justifyContent: 'center', alignItems: 'center' }]}>
+        <Text style={{ fontSize: 80 }}>🎉</Text>
+        <Text style={{ fontSize: 24, fontWeight: 'bold', marginTop: 20 }}>만났어요!</Text>
+        <TouchableOpacity style={[styles.mainStartBtn, { marginTop: 40, width: 200 }]} onPress={exitSession}>
+          <Text style={styles.mainStartBtnText}>종료</Text>
+        </TouchableOpacity>
+      </SafeAreaView>
+    );
+  }
+
+  // ── MAIN 화면 (팀원 UI 그대로) ──
   return (
-    <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', gap: 16, padding: 20, backgroundColor: '#f5f5f5' }}>
+    <SafeAreaView style={styles.safeArea}>
+      <StatusBar barStyle="dark-content" />
 
-      {routerCount > 0 && (
-        <View style={{ backgroundColor: '#e8ffe8', padding: 8, borderRadius: 8, width: '100%', alignItems: 'center' }}>
-          <Text style={{ color: '#228833' }}>📡 라우터 {routerCount}개 연결 → 정확도 향상</Text>
-        </View>
+      <View style={styles.fullMapContainer}>
+        {activeTab === 'MAP' ? (
+          <MapView
+            style={styles.full}
+            provider={PROVIDER_GOOGLE}
+            customMapStyle={refinedMapStyle}
+            region={{
+              latitude: myLocation ? myLocation.latitude : KOREA_CENTER.latitude,
+              longitude: myLocation ? myLocation.longitude : KOREA_CENTER.longitude,
+              latitudeDelta: 0.01, longitudeDelta: 0.01,
+            }}
+          >
+            {myLocation && targetLoc && <Polyline coordinates={[myLocation, targetLoc]} strokeWidth={4} strokeColor={COLORS.primary} lineDashPattern={[6, 6]} zIndex={1} />}
+            {myLocation && (
+              <Marker key="me" coordinate={myLocation} anchor={{ x: 0.5, y: 0.5 }} zIndex={100} tracksViewChanges={trackChanges}>
+                <View style={styles.simpleMarker}><View style={[styles.dotCore, { backgroundColor: COLORS.primary }]} /></View>
+              </Marker>
+            )}
+            {targetLoc && (
+              <Marker key="target" coordinate={targetLoc} anchor={{ x: 0.5, y: 0.5 }} zIndex={99} tracksViewChanges={trackChanges}>
+                <View style={styles.simpleMarker}><View style={[styles.dotCore, { backgroundColor: COLORS.accent }]} /></View>
+              </Marker>
+            )}
+          </MapView>
+        ) : (
+          <View style={styles.arrowCenter}>
+            <View style={styles.outerCircle}>
+              <View style={[styles.arrowWrapper, { transform: [{ rotate: `${arrowRotation}deg` }] }]}>
+                <View style={styles.arrowHead} /><View style={styles.arrowStem} />
+              </View>
+            </View>
+          </View>
+        )}
+      </View>
+
+      <View style={styles.glassTabContainer}>
+        <TouchableOpacity style={[styles.glassTabBtn, activeTab === 'MAP' && styles.activeGlassTab]} onPress={() => setActiveTab('MAP')}>
+          <Text style={[styles.glassTabText, activeTab === 'MAP' && styles.activeGlassTabText]}>지도</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={[styles.glassTabBtn, activeTab === 'ARROW' && styles.activeGlassTab]} onPress={() => setActiveTab('ARROW')}>
+          <Text style={[styles.glassTabText, activeTab === 'ARROW' && styles.activeGlassTabText]}>방향</Text>
+        </TouchableOpacity>
+      </View>
+
+      {!isChatOpen && (
+        <TouchableOpacity style={styles.floatingChatBtn} onPress={() => setIsChatOpen(true)}>
+          <Text style={styles.floatingChatBtnText}>💬 대화하기</Text>
+        </TouchableOpacity>
       )}
 
-      <View style={{ alignItems: 'center', backgroundColor: '#fff', padding: 32, borderRadius: 20, width: '100%', shadowColor: '#000', shadowOpacity: 0.1, shadowRadius: 10 }}>
-        <Text style={{ fontSize: 80, lineHeight: 100, textAlign: 'center' }}>{arrow}</Text>
-        <Text style={{ fontSize: 36, fontWeight: 'bold', marginTop: 8 }}>
-          {displayDistance !== null ? `${displayDistance.toFixed(1)}m` : '-'}
-        </Text>
-        <Text style={{ color: '#888', marginTop: 4 }}>
-          {distanceMode.toUpperCase()} · {directionMode === 'uwb_azimuth' ? 'UWB방향' : 'GPS방향'}
-        </Text>
-      </View>
+      {isChatOpen && (
+        <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.glassChatOverlay}>
+          <View style={styles.liquidGlassPanel}>
+            <View style={styles.glassHeader}>
+              <View style={styles.glassHandle} />
+              <TouchableOpacity onPress={() => setIsChatOpen(false)} style={styles.glassCloseBtn}>
+                <Text style={styles.glassCloseBtnText}>접기 ✕</Text>
+              </TouchableOpacity>
+            </View>
+            <FlatList
+              ref={flatListRef}
+              data={chatHistory}
+              keyExtractor={(item) => item.id}
+              contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 15 }}
+              onContentSizeChange={() => flatListRef.current?.scrollToEnd({ animated: true })}
+              onLayout={() => flatListRef.current?.scrollToEnd({ animated: true })}
+              renderItem={({ item }) => {
+                const isMe = item.sender === userRole;
+                return (
+                  <View style={[styles.chatBubbleWrapper, isMe ? styles.chatMeWrapper : styles.chatOtherWrapper]}>
+                    <View style={[styles.liquidBubble, isMe ? styles.liquidBubbleMe : styles.liquidBubbleOther]}>
+                      <Text style={[styles.chatText, isMe ? styles.chatTextMe : styles.chatTextOther]}>{item.text}</Text>
+                    </View>
+                  </View>
+                );
+              }}
+              ListEmptyComponent={<Text style={styles.emptyGlassText}>리퀴드 글래스 대화방이 활성화되었습니다.</Text>}
+            />
+            <View style={styles.glassInputArea}>
+              <TextInput
+                style={styles.glassTextInput}
+                placeholder="메시지 또는 층수 입력..."
+                placeholderTextColor="rgba(0,0,0,0.3)"
+                value={chatInput}
+                onChangeText={setChatInput}
+                onSubmitEditing={sendChatMessage}
+              />
+              <TouchableOpacity style={styles.glassSendBtn} onPress={sendChatMessage}>
+                <Text style={styles.glassSendBtnText}>전송</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </KeyboardAvoidingView>
+      )}
 
-      <View style={{ backgroundColor: '#fff', padding: 16, borderRadius: 12, width: '100%' }}>
-        <Text style={{ fontWeight: 'bold', marginBottom: 8 }}>디버그</Text>
-        <Text>나: {myId} ({Platform.OS}) {myId === 'userA' ? '👑' : '📡'}</Text>
-        <Text>GPS 거리: {gpsDistance?.toFixed(1) ?? '-'}m</Text>
-        <Text>UWB 거리: {uwbDistance?.toFixed(2) ?? '-'}m</Text>
-        <Text>GPS 방향: {gpsBearing?.toFixed(1) ?? '-'}°</Text>
-        <Text>UWB azimuth: {uwbAzimuth?.toFixed(3) ?? '-'}</Text>
-        <Text>전환: 진입 {UWB_ENTER_THRESHOLD}m / 탈출 {UWB_EXIT_THRESHOLD}m</Text>
-        <Text>측위 모드: {posMode} (신뢰도: {(confidence * 100).toFixed(0)}%)</Text>
-      </View>
-    </View>
+      {!isChatOpen && (
+        <View style={styles.minimalBottomBar}>
+          <View style={styles.miniInfo}>
+            <Text style={styles.miniLabel}>상대방 거리</Text>
+            <Text style={styles.miniValue}>{targetLoc ? `${distance}m` : '연결 중'}</Text>
+          </View>
+          <TouchableOpacity style={styles.miniExitBtn} onPress={exitSession}>
+            <Text style={styles.miniExitText}>종료</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+    </SafeAreaView>
   );
 }
+
+const styles = StyleSheet.create({
+  safeArea: { flex: 1, backgroundColor: '#fff' },
+  full: { flex: 1 },
+  fullMapContainer: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
+  tokenContainer: { padding: 24 },
+  mainTitle: { fontSize: 24, fontWeight: 'bold', marginBottom: 32, marginTop: 20 },
+  codeSection: { alignItems: 'center', marginBottom: 24 },
+  sectionLabel: { fontSize: 15, fontWeight: '700', color: '#111827', marginBottom: 10, alignSelf: 'flex-start' },
+  codeCard: { backgroundColor: '#F9FAFB', width: '100%', padding: 24, borderRadius: 20, borderWidth: 1, borderColor: '#E5E7EB', alignItems: 'center' },
+  codeText: { fontSize: 42, fontWeight: 'bold', letterSpacing: 8, color: '#2563EB' },
+  copyHint: { marginTop: 8, color: '#6B7280', fontSize: 12 },
+  mainStartBtn: { backgroundColor: '#111827', width: '100%', height: 55, borderRadius: 15, justifyContent: 'center', alignItems: 'center', marginTop: 16 },
+  mainStartBtnText: { color: '#fff', fontWeight: 'bold', fontSize: 16 },
+  shareOptions: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 32 },
+  shareBtn: { flex: 0.31, paddingVertical: 14, borderRadius: 12, alignItems: 'center' },
+  shareBtnText: { fontWeight: 'bold', fontSize: 13 },
+  joinSection: { marginBottom: 32 },
+  joinInputRow: { flexDirection: 'row', gap: 10 },
+  joinInput: { flex: 1, backgroundColor: '#F9FAFB', borderWidth: 1, borderColor: '#E5E7EB', borderRadius: 12, paddingHorizontal: 16, fontSize: 16 },
+  joinBtn: { backgroundColor: '#111827', paddingHorizontal: 24, justifyContent: 'center', alignItems: 'center', borderRadius: 12 },
+  recentSection: { flex: 1, marginTop: 10 },
+  friendItem: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#FFF', padding: 16, borderRadius: 16, marginBottom: 12, borderWidth: 1, borderColor: '#E5E7EB' },
+  friendProfile: { width: 44, height: 44, borderRadius: 22, backgroundColor: '#EFF6FF', justifyContent: 'center', alignItems: 'center', marginRight: 14 },
+  friendInitial: { color: '#2563EB', fontWeight: 'bold', fontSize: 16 },
+  friendInfo: { flex: 1 },
+  friendName: { fontSize: 16, fontWeight: 'bold' },
+  friendDate: { fontSize: 12, color: '#6B7280' },
+  startText: { color: '#2563EB', fontWeight: '600' },
+  glassTabContainer: { flexDirection: 'row', position: 'absolute', top: 60, alignSelf: 'center', backgroundColor: 'rgba(255, 255, 255, 0.6)', borderRadius: 25, padding: 5, borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.4)', zIndex: 10 },
+  glassTabBtn: { paddingHorizontal: 25, paddingVertical: 10, borderRadius: 20 },
+  activeGlassTab: { backgroundColor: '#fff' },
+  glassTabText: { fontSize: 14, color: '#666', fontWeight: '600' },
+  activeGlassTabText: { color: '#2563EB' },
+  floatingChatBtn: { position: 'absolute', bottom: 110, right: 20, backgroundColor: '#111827', paddingHorizontal: 20, paddingVertical: 12, borderRadius: 25, elevation: 10, shadowColor: '#000', shadowOpacity: 0.2, shadowRadius: 10 },
+  floatingChatBtnText: { color: '#fff', fontWeight: 'bold' },
+  glassChatOverlay: { position: 'absolute', bottom: 0, left: 0, right: 0, height: height * 0.45, zIndex: 999 },
+  liquidGlassPanel: { flex: 1, backgroundColor: 'rgba(255, 255, 255, 0.85)', borderTopLeftRadius: 35, borderTopRightRadius: 35, borderWidth: 1.5, borderColor: 'rgba(255, 255, 255, 0.5)', shadowColor: '#000', shadowOpacity: 0.1, shadowRadius: 20 },
+  glassHeader: { padding: 15, alignItems: 'center', marginBottom: 5 },
+  glassHandle: { width: 40, height: 5, backgroundColor: 'rgba(0,0,0,0.1)', borderRadius: 10, marginBottom: 10 },
+  glassCloseBtn: { position: 'absolute', right: 20, top: 15 },
+  glassCloseBtnText: { color: '#666', fontWeight: '600' },
+  chatBubbleWrapper: { flexDirection: 'row', marginVertical: 4, width: '100%' },
+  chatMeWrapper: { justifyContent: 'flex-end' },
+  chatOtherWrapper: { justifyContent: 'flex-start' },
+  liquidBubble: { paddingHorizontal: 16, paddingVertical: 10, borderRadius: 22, maxWidth: '80%', borderWidth: 1 },
+  liquidBubbleMe: { backgroundColor: 'rgba(37, 99, 235, 0.85)', borderColor: 'rgba(255, 255, 255, 0.2)' },
+  liquidBubbleOther: { backgroundColor: 'rgba(255, 255, 255, 0.9)', borderColor: 'rgba(0, 0, 0, 0.05)' },
+  chatText: { fontSize: 15, lineHeight: 20 },
+  chatTextMe: { color: '#fff' },
+  chatTextOther: { color: '#333' },
+  emptyGlassText: { color: '#999', textAlign: 'center', fontStyle: 'italic', fontSize: 13, marginTop: 50 },
+  glassInputArea: { flexDirection: 'row', padding: 20, paddingBottom: Platform.OS === 'ios' ? 40 : 20, borderTopWidth: 1, borderTopColor: 'rgba(0,0,0,0.05)' },
+  glassTextInput: { flex: 1, backgroundColor: 'rgba(255, 255, 255, 0.8)', height: 48, borderRadius: 24, paddingHorizontal: 20, borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.5)' },
+  glassSendBtn: { marginLeft: 10, backgroundColor: '#111827', paddingHorizontal: 20, borderRadius: 24, justifyContent: 'center' },
+  glassSendBtnText: { color: '#fff', fontWeight: 'bold' },
+  minimalBottomBar: { position: 'absolute', bottom: 30, left: 20, right: 20, height: 70, backgroundColor: 'rgba(255, 255, 255, 0.9)', borderRadius: 20, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 20, borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.5)', shadowColor: '#000', shadowOpacity: 0.05, shadowRadius: 10 },
+  miniInfo: { flex: 1 },
+  miniLabel: { fontSize: 10, color: '#999', fontWeight: 'bold' },
+  miniValue: { fontSize: 20, fontWeight: 'bold', color: '#2563EB' },
+  miniExitBtn: { backgroundColor: '#FF4444', paddingHorizontal: 15, paddingVertical: 8, borderRadius: 12 },
+  miniExitText: { color: '#fff', fontWeight: 'bold', fontSize: 12 },
+  mainView: { flex: 1 },
+  arrowCenter: { flex: 1, justifyContent: 'center', alignItems: 'center' },
+  outerCircle: { width: 220, height: 220, borderRadius: 110, backgroundColor: 'rgba(255, 255, 255, 0.8)', justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.4)' },
+  arrowWrapper: { alignItems: 'center', justifyContent: 'center' },
+  arrowHead: { width: 0, height: 0, borderLeftWidth: 30, borderLeftColor: 'transparent', borderRightWidth: 30, borderRightColor: 'transparent', borderBottomWidth: 45, borderBottomColor: '#2563EB' },
+  arrowStem: { width: 22, height: 45, backgroundColor: '#2563EB', marginTop: -5 },
+  simpleMarker: { width: 60, height: 60, alignItems: 'center', justifyContent: 'center' },
+  dotCore: { width: 18, height: 18, borderRadius: 9, borderWidth: 3, borderColor: '#FFFFFF', elevation: 6 },
+});
